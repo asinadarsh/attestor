@@ -305,8 +305,12 @@ export class Ledger {
       hash,
       sig,
     };
-    const line = JSON.stringify(entry) + '\n';
-    writeSync(this.fd, line);
+    const line = Buffer.from(JSON.stringify(entry) + '\n', 'utf8');
+    // writeSync can short-write a large buffer; loop so a big payload never
+    // leaves a torn line in the middle of the ledger (a false tamper signal).
+    for (let off = 0; off < line.length; ) {
+      off += writeSync(this.fd, line, off, line.length - off);
+    }
     if (this.durability === 'strict') {
       fsyncSync(this.fd);
     } else {
