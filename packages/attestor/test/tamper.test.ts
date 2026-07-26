@@ -231,6 +231,37 @@ test('anchor lag reported for entries after last anchored checkpoint', async () 
   assert.ok(report.anchorLag!.count >= 1);
 });
 
+test('--entry SEQ: inclusion path to nearest covering (anchored) checkpoint', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const report = await verifyLedger(ledgerDir, { entry: 3 });
+  assert.equal(report.exitCode, 0);
+  assert.ok(report.entryFocus);
+  assert.equal(report.entryFocus!.seq, 3);
+  assert.equal(report.entryFocus!.ok, true);
+  assert.equal(report.entryFocus!.anchored, true);
+  assert.ok(report.entryFocus!.proofLength! >= 1);
+});
+
+test('--entry SEQ on a tampered entry reports inclusion failure', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const lines = readLines(ledgerDir);
+  const e = JSON.parse(lines[3]!) as LedgerEntry;
+  e.ts = '1999-01-01T00:00:00.000Z';
+  lines[3] = JSON.stringify(e);
+  writeLines(ledgerDir, lines);
+  const report = await verifyLedger(ledgerDir, { entry: 3 });
+  assert.equal(report.exitCode, 1);
+  assert.equal(report.entryFocus!.ok, false);
+});
+
+test('--entry SEQ out of range is reported, not crashed', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const report = await verifyLedger(ledgerDir, { entry: 9999 });
+  assert.ok(report.entryFocus);
+  assert.equal(report.entryFocus!.ok, false);
+  assert.ok(report.entryFocus!.note.includes('out of range'));
+});
+
 test('missing anchor file for anchor entry: fails', async () => {
   const { ledgerDir } = buildAnchoredLedger();
   const lines = readLines(ledgerDir);

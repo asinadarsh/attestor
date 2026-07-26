@@ -15,6 +15,7 @@ import {
   type LedgerEntry,
 } from './ledger.ts';
 import { computeRootHex, type CheckpointPayload } from './checkpoint.ts';
+import { inclusionProof, leafHash, verifyInclusion } from './merkle.ts';
 import {
   getEntry,
   RekorUnavailableError,
@@ -47,6 +48,16 @@ export interface VerifyReport {
   findings: TamperFinding[];
   blastRadius?: { from: number; to: number };
   anchorLag?: { count: number; fromSeq: number; toSeq: number };
+  entryFocus?: {
+    seq: number;
+    ok: boolean;
+    checkpointSeq?: number;
+    treeSize?: number;
+    proofLength?: number;
+    anchored?: boolean;
+    logIndex?: number;
+    note: string;
+  };
   entryCount: number;
   ledgerId?: string;
   auditPacket?: Record<string, unknown>;
@@ -536,6 +547,50 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     });
   }
 
+  // ---- entry focus (--entry SEQ): inclusion path to nearest checkpoint ----
+  let entryFocus: VerifyReport['entryFocus'];
+  if (opts.entry !== undefined) {
+    const seq = opts.entry;
+    if (seq < 0 || seq >= n) {
+      entryFocus = { seq, ok: false, note: `entry ${seq} out of range [0, ${n})` };
+    } else {
+      // nearest checkpoint whose tree covers this entry, preferring an anchored one
+      const anchoredCkptSeqs = new Set(anchors.map((a) => a.payload.checkpoint_seq));
+      const covering = checkpoints
+        .map((c) => ({ c, p: checkpointPayloads.get(c.seq) }))
+        .filter((x) => x.p !== undefined && x.p.tree_size > seq && x.p.tree_size <= n)
+        .sort((a, b) => a.p!.tree_size - b.p!.tree_size);
+      const anchoredPick = covering.find((x) => anchoredCkptSeqs.has(x.c.seq));
+      const pick = anchoredPick ?? covering[0];
+      if (!pick) {
+        entryFocus = {
+          seq,
+          ok: findings.every((f) => f.seq !== seq),
+          note: `entry ${seq} hash+signature checked; no checkpoint covers it yet (ANCHOR LAG region)`,
+        };
+      } else {
+        const size = pick.p!.tree_size;
+        const leaves = recomputed.slice(0, size).map((h) => Buffer.from(h, 'hex'));
+        const proof = inclusionProof(seq, leaves);
+        const ok = verifyInclusion(seq, size, leafHash(leaves[seq]!), proof, Buffer.from(pick.p!.root, 'hex'));
+        const anchor = anchors.find((a) => a.payload.checkpoint_seq === pick.c.seq);
+        entryFocus = {
+          seq,
+          ok: ok && findings.every((f) => f.seq !== seq),
+          checkpointSeq: pick.c.seq,
+          treeSize: size,
+          proofLength: proof.length,
+          anchored: anchor !== undefined,
+          ...(anchor !== undefined && { logIndex: anchor.payload.logIndex }),
+          note: ok
+            ? `entry ${seq} included in checkpoint ${pick.c.seq} (tree_size ${size}, ${proof.length}-hash proof)` +
+              (anchor ? `, anchored at Rekor logIndex ${anchor.payload.logIndex}` : ', not yet anchored')
+            : `entry ${seq} FAILS inclusion in checkpoint ${pick.c.seq}`,
+        };
+      }
+    }
+  }
+
   // ---- verdict ----------------------------------------------------------
   const tamper = findings.length > 0;
   const firstSeq = tamper ? Math.min(...findings.map((f) => f.seq)) : undefined;
@@ -550,6 +605,7 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       blastRadius: { from: firstSeq!, to: n - 1 },
     }),
     ...(anchorLag !== undefined && { anchorLag }),
+    ...(entryFocus !== undefined && { entryFocus }),
   };
   if (tamper) {
     report.auditPacket = {
@@ -617,6 +673,10 @@ export function renderReport(report: VerifyReport, useColor = process.stdout.isT
     out.push(
       `${c(DIM, 'ℹ')} ANCHOR LAG  ${report.anchorLag.count} entr${report.anchorLag.count === 1 ? 'y' : 'ies'} (seq ${report.anchorLag.fromSeq}–${report.anchorLag.toSeq}) after last anchor — chain-protected, not yet anchored`,
     );
+  }
+  if (report.entryFocus) {
+    const f = report.entryFocus;
+    out.push(`${f.ok ? c(GREEN, '✔') : c(RED, '✖')} ENTRY ${String(f.seq).padEnd(4)} ${f.ok ? f.note : c(RED, f.note)}`);
   }
   out.push(
     `RESULT: ${
