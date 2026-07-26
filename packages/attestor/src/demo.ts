@@ -50,14 +50,20 @@ function header(s: string): void {
 export async function runDemo(argv: string[]): Promise<void> {
   const sub = argv[0];
   if (sub !== 'tamper') {
-    process.stderr.write('attestor: usage: attestor demo tamper [--offline]\n');
+    process.stderr.write('attestor: usage: attestor demo tamper [--live]\n');
     process.exit(2);
   }
   const { values } = parseArgs({
     args: argv.slice(1),
-    options: { offline: { type: 'boolean', default: false } },
+    options: {
+      live: { type: 'boolean', default: false },
+      offline: { type: 'boolean', default: false },
+    },
   });
-  const offline = values.offline || process.env.ATTESTOR_OFFLINE === '1';
+  // Default OFFLINE on purpose: the demo must not write a junk entry into
+  // Sigstore's shared public log every time somebody reads the README.
+  // `--live` opts in to a real anchor.
+  const offline = !values.live || values.offline || process.env.ATTESTOR_OFFLINE === '1';
 
   const dir = mkdtempSync(join(tmpdir(), 'attestor-demo-'));
   const home = join(dir, 'home');
@@ -91,8 +97,8 @@ export async function runDemo(argv: string[]): Promise<void> {
   let logIndex: number | undefined;
   if (offline) {
     simulateAnchor(ledger, ckpt);
-    say('  anchor: SIMULATED (offline mode) — not in the public log.');
-    say('          run without --offline to anchor in Sigstore Rekor for real.');
+    say('  anchor: SIMULATED — nothing was written to the public log.');
+    say('          `attestor demo tamper --live` anchors in Sigstore Rekor for real.');
   } else {
     const anchorEntry = await anchorCheckpoint(ledger, ckpt, {});
     if (anchorEntry) {

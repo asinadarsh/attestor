@@ -50,5 +50,19 @@
     "ai-agents",
     "compliance",
     "merkle"
-  ]
+  ],
+  "author": "asinadarsh",
+  "homepage": "https://github.com/asinadarsh/attestor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/asinadarsh/attestor.git",
+    "directory": "packages/attestor"
+  },
+  "bugs": {
+    "url": "https://github.com/asinadarsh/attestor/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

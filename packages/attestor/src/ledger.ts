@@ -158,7 +158,8 @@ export function payloadHash(saltHex: string | undefined, payload: string | undef
 }
 
 export interface GapNote {
-  unrecorded_lines: number;
+  unrecorded_lines?: number;
+  unrecorded_events?: number;
   from_ts?: string;
   to_ts: string;
 }

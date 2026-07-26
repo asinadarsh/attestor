@@ -23,7 +23,7 @@ Usage:
   attestor export <ledger-dir> [--out <dir>]     write a regulator-ready evidence pack
   attestor redact <ledger-dir> <seq>             strip a payload (chain & sigs stay valid)
   attestor replay <ledger-dir> [--session <id>]  print recorded tool calls
-  attestor demo tamper [--offline]               30-second tamper-evidence demo
+  attestor demo tamper [--live]                  30-second tamper-evidence demo (offline by default)
 
 Options:
   --ledger <dir>        ledger directory (default $ATTESTOR_HOME/ledgers/default)

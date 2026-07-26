@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { attestorHome, generateKey, listKeyIds, loadKey, type KeyPair } from './keys.ts';
 import { Checkpointer, lastCheckpointSize } from './checkpoint.ts';
 import { anchorCheckpoint } from './rekor.ts';
-import { Ledger, readEntries, uuidv7, type LedgerEntry } from './ledger.ts';
+import { Ledger, readEntries, uuidv7, writeGapPending, type LedgerEntry } from './ledger.ts';
 
 export interface AttestorOptions {
   /** Ledger directory. Default: $ATTESTOR_HOME/ledgers/sdk */
@@ -147,6 +147,8 @@ export class Attestor {
   private readonly sessionId: string;
   private gapCount = 0;
   private gapFrom: string | undefined;
+  /** In-flight anchor promises, drained by close(). */
+  private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(opts: AttestorOptions = {}) {
     this.ledgerDir = opts.ledger ?? join(attestorHome(), 'ledgers', 'sdk');
@@ -161,7 +163,11 @@ export class Attestor {
     this.checkpointer = new Checkpointer(this.ledger, {
       initialCoveredSize: lastCheckpointSize(readEntries(join(this.ledgerDir, 'ledger.jsonl'))),
       onCheckpoint: (entry) => {
-        void anchorCheckpoint(this.ledger, entry, { offline: this.offline }).catch(() => {});
+        const p = anchorCheckpoint(this.ledger, entry, { offline: this.offline }).catch((err) =>
+          process.stderr.write(`[attestor] anchor failed: ${(err as Error).message}\n`),
+        );
+        this.inFlight.add(p);
+        void p.finally(() => this.inFlight.delete(p));
       },
     });
     this.checkpointer.setSession(this.sessionId);
@@ -210,12 +216,21 @@ export class Attestor {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
       let bodyText: string | undefined;
+      let bodyUnrecordable: string | undefined;
       const rawBody = init?.body;
       if (typeof rawBody === 'string') bodyText = rawBody;
       else if (rawBody instanceof Uint8Array) bodyText = Buffer.from(rawBody).toString('utf8');
-      else if (input instanceof Request && rawBody === undefined) {
-        bodyText = await input.clone().text().catch(() => undefined);
-        if (bodyText === '') bodyText = undefined;
+      else if (rawBody instanceof ArrayBuffer) bodyText = Buffer.from(rawBody).toString('utf8');
+      else if (rawBody instanceof URLSearchParams) bodyText = rawBody.toString();
+      else if (rawBody === undefined || rawBody === null) {
+        if (input instanceof Request) {
+          bodyText = await input.clone().text().catch(() => undefined);
+          if (bodyText === '') bodyText = undefined;
+        }
+      } else {
+        // FormData / Blob / ReadableStream: transmitted but not captured as
+        // text. The record must SAY so rather than look like an empty body.
+        bodyUnrecordable = rawBody?.constructor?.name ?? 'unknown';
       }
       const callId = uuidv7();
       let host = 'unknown';
@@ -224,6 +239,12 @@ export class Attestor {
       } catch {
         /* keep 'unknown' */
       }
+      if (bodyUnrecordable !== undefined && this.failMode === 'block') {
+        throw new Error(
+          `attestor: cannot record a ${bodyUnrecordable} request body (fail-closed). ` +
+            `Serialize the body yourself, or construct Attestor with failMode: 'continue'.`,
+        );
+      }
       // flight-recorder semantics: the attempt is on record BEFORE dispatch
       this.append({
         type: 'call_request',
@@ -231,6 +252,9 @@ export class Attestor {
         call_id: callId,
         tool: { server: host, name: `${method} ${safePath(url)}` },
         ...(bodyText !== undefined && { payload: bodyText }),
+        ...(bodyUnrecordable !== undefined && {
+          payload: JSON.stringify({ attestor_note: 'request body not captured', body_type: bodyUnrecordable }),
+        }),
       });
 
       const res = await base(input as Parameters<typeof fetch>[0], init);
@@ -259,13 +283,40 @@ export class Attestor {
           return res;
         }
       }
+      // Streaming (or continue mode): record at our own pace. A failure here
+      // must still leave a durable hole-marker — in block mode the strictest
+      // setting must not produce weaker evidence than the lenient one.
       void recordClone
         .text()
         .then(finalize)
-        .catch((err) => process.stderr.write(`[attestor] response record failed: ${(err as Error).message}\n`));
+        .catch((err) => {
+          process.stderr.write(`[attestor] response record failed: ${(err as Error).message}\n`);
+          this.noteUnrecorded();
+        });
       return res;
     };
     return wrapped as typeof fetch;
+  }
+
+  /**
+   * Record that something could not be written. Tries an in-chain gap marker
+   * first; if even that fails, persists a note so the next open folds it in.
+   */
+  private noteUnrecorded(): void {
+    try {
+      this.ledger.append({
+        type: 'gap',
+        origin: 'sdk',
+        session_id: this.sessionId,
+        payload: JSON.stringify({ unrecorded_events: 1, to_ts: new Date().toISOString() }),
+      });
+    } catch {
+      try {
+        writeGapPending(this.ledgerDir, { unrecorded_events: 1, to_ts: new Date().toISOString() });
+      } catch {
+        /* nothing more we can do */
+      }
+    }
   }
 
   /** Attest what the app actually did between model round trips. */
@@ -291,8 +342,12 @@ export class Attestor {
     this.append({ type: 'session_end', origin: 'sdk' });
     this.checkpointer.checkpointNow();
     this.checkpointer.stop();
-    // give an in-flight anchor a moment; queued anchors survive in pending.jsonl
-    await new Promise((r) => setTimeout(r, 25));
+    // Drain in-flight anchors: closing underneath one loses the anchor entry
+    // even though Rekor accepted the artifact. Each request is bounded by its
+    // own timeout, so this cannot hang indefinitely.
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
     this.ledger.close();
   }
 }

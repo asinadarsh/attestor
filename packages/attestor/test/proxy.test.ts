@@ -234,3 +234,93 @@ test('classifyLine: request/response/notification/unparsed', () => {
   assert.equal(classifyLine(Buffer.from('garbage')).kind, 'unparsed');
   assert.equal(classifyLine(Buffer.from('123')).kind, 'unparsed');
 });
+
+test('install gives each server its own ledger so concurrent servers do not deadlock', async () => {
+  const { wrapConfig } = await import('../src/cli.ts');
+  const config = {
+    mcpServers: {
+      github: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-github'] },
+      'My Files!': { command: 'node', args: ['files.js'] },
+    },
+  };
+  const { changed } = wrapConfig(config);
+  assert.deepEqual(changed, ['github', 'My Files!']);
+  const names = Object.values(config.mcpServers).map((d) => {
+    const i = d.args!.indexOf('--ledger-name');
+    return d.args![i + 1];
+  });
+  assert.deepEqual(names, ['github', 'my-files']);
+  assert.equal(new Set(names).size, names.length, 'ledger dirs must be distinct');
+
+  // idempotent across spellings
+  const again = wrapConfig(config);
+  assert.deepEqual(again.changed, []);
+  const npxStyle = { mcpServers: { a: { command: 'npx', args: ['attestor', 'wrap', '--', 'node', 's.js'] } } };
+  assert.deepEqual(wrapConfig(npxStyle).changed, [], 'npx attestor wrap already counts as wrapped');
+});
+
+test('unterminated final line is relayed AND recorded, not dropped', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(join(dir, 'ledger'), keys);
+  const ckpt = new Checkpointer(ledger, { idleMs: 3600_000 });
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const done = runProxy({
+    ledger,
+    checkpointer: ckpt,
+    command: process.execPath,
+    args: ['-e', 'process.stdin.pipe(process.stdout)'],
+    stdin,
+    stdout,
+    stderr: new PassThrough(),
+  });
+  stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}'); // NO trailing newline
+  await sleep(120);
+  stdin.end();
+  await done;
+  ledger.close();
+
+  const entries = readEntries(join(dir, 'ledger', 'ledger.jsonl'));
+  assert.ok(
+    entries.some((e) => e.payload === '{"jsonrpc":"2.0","id":1,"method":"ping"}'),
+    'unterminated tail must still reach the ledger',
+  );
+});
+
+test('gap survives a process that never recovers: pending note folded in on next open', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const ledgerDir = join(dir, 'ledger');
+  const ledger = Ledger.open(ledgerDir, keys);
+  const ckpt = new Checkpointer(ledger, { idleMs: 3600_000 });
+  const realAppend = ledger.append.bind(ledger);
+  (ledger as { append: typeof ledger.append }).append = () => {
+    throw new Error('disk full (injected)');
+  };
+  const stdin = new PassThrough();
+  const done = runProxy({
+    ledger,
+    checkpointer: ckpt,
+    command: process.execPath,
+    args: ['-e', 'process.stdin.pipe(process.stdout)'],
+    onError: 'continue',
+    stdin,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  });
+  stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+  await sleep(120);
+  stdin.end();
+  await done;
+  (ledger as { append: typeof ledger.append }).append = realAppend;
+  ledger.close();
+
+  // next successful open must fold the hole into the signed chain
+  const reopened = Ledger.open(ledgerDir, keys);
+  reopened.close();
+  const entries = readEntries(join(ledgerDir, 'ledger.jsonl'));
+  assert.ok(entries.some((e) => e.type === 'gap'), 'unrecovered gap must not vanish silently');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings));
+});

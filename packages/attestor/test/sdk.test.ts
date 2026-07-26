@@ -192,3 +192,64 @@ test('continue mode: call proceeds, gap marker on recovery', async () => {
   const gap = entries.find((e) => e.type === 'gap');
   assert.ok(gap, 'gap marker recorded after recovery');
 });
+
+test('block mode refuses an unrecordable body type instead of silently omitting it', async () => {
+  const { attestor } = newAttestor();
+  const stub = stubFetch(OPENAI_CHAT_BODY);
+  const wrapped = attestor.wrapFetch(stub.fetch);
+  const form = new FormData();
+  form.append('file', 'audio-bytes');
+  await assert.rejects(
+    () => wrapped('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', body: form }),
+    /cannot record a FormData request body/,
+  );
+  assert.equal(stub.calls.length, 0, 'never dispatched without a record');
+  await attestor.close();
+});
+
+test('continue mode records an explicit note for an unrecordable body', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const attestor = new Attestor({ ledger: join(dir, 'ledger'), keys, offline: true, failMode: 'continue' });
+  const stub = stubFetch(OPENAI_CHAT_BODY);
+  const wrapped = attestor.wrapFetch(stub.fetch);
+  const form = new FormData();
+  form.append('file', 'audio-bytes');
+  await wrapped('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', body: form });
+  await attestor.close();
+  const req = readEntries(join(dir, 'ledger', 'ledger.jsonl')).find((e) => e.type === 'call_request')!;
+  assert.match(req.payload!, /body not captured/);
+  assert.match(req.payload!, /FormData/);
+});
+
+test('a failed streaming record leaves a gap marker even in block mode', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const attestor = new Attestor({ ledger: join(dir, 'ledger'), keys, offline: true });
+  const sseFetch = (async () =>
+    new Response('data: {"type":"content_block_stop","index":0}\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })) as typeof fetch;
+  const wrapped = attestor.wrapFetch(sseFetch);
+  const res = await wrapped('https://api.anthropic.com/v1/messages', { method: 'POST', body: '{}' });
+
+  // break the ledger only for the async call_result write
+  const internal = (attestor as unknown as { ledger: { append: (...a: unknown[]) => unknown } }).ledger;
+  const realAppend = internal.append.bind(internal);
+  let broken = true;
+  internal.append = (...args: unknown[]) => {
+    if (broken) {
+      broken = false; // fail the call_result, let the gap marker through
+      throw new Error('disk full (injected)');
+    }
+    return realAppend(...args);
+  };
+  await res.text();
+  await sleep(120);
+  broken = false;
+  await attestor.close();
+
+  const entries = readEntries(join(dir, 'ledger', 'ledger.jsonl'));
+  assert.ok(entries.some((e) => e.type === 'gap'), 'block mode must not swallow a failed stream record');
+});
