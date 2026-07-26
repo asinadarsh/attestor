@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Attestor evidence pack — 019fa0d9-a83b-7c8e-a84a-2d98d4c089b7</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .verdict { padding: .6rem 1rem; border-radius: 6px; font-weight: 600; display: inline-block; }
+  .ok { background: #e6f4ea; color: #137333; } .bad { background: #fce8e6; color: #c5221f; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f5; } td.p { font-family: ui-monospace, monospace; word-break: break-all; }
+  .note { color: #555; font-size: 13px; }
+</style>
+<h1>Attestor evidence pack</h1>
+<p><span class="verdict ok">verify at export: VERIFIED</span></p>
+<p class="note">Ledger 019fa0d9-a83b-7c8e-a84a-2d98d4c089b7 · 13 entries · 2 tool calls · 1 public anchors.
+Re-run verification yourself — see <code>VERIFY.md</code>. This report is a rendering convenience, not the evidence; the evidence is <code>ledger/entries.jsonl</code> + the public Rekor log.</p>
+<h2>Public anchors (Sigstore Rekor)</h2>
+<table><tr><th>checkpoint seq</th><th>logIndex</th><th>integratedTime (trusted)</th><th>public record</th></tr><tr><td>11</td><td>2256661985</td><td>2026-07-26T23:54:07.000Z</td><td><a href="https://search.sigstore.dev/?logIndex=2256661985">search.sigstore.dev</a></td></tr></table>
+<h2>Control mappings</h2>
+<p class="note">Evidence support only — compliance determinations are made by your assessor (see <code>controls/mapping.json</code>): SOC 2 CC7.2 / CC7.3 / CC4.1 · EU AI Act Art. 12 · HIPAA §164.312(b).</p>
+<h2>Timeline</h2>
+<table><tr><th>seq</th><th>ts (claimed)</th><th>type</th><th>tool</th><th>payload</th></tr>
+<tr><td>0</td><td>2026-07-26T23:54:06.779Z</td><td>genesis</td><td></td><td class="p">{"ledger_id":"019fa0d9-a83b-7c8e-a84a-2d98d4c089b7","public_key_pem":"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMQjgX2pHqXuPgvzvoi+BQf9…</td></tr>
+<tr><td>1</td><td>2026-07-26T23:54:06.781Z</td><td>session_start</td><td></td><td class="p">{"session_id":"019fa0d9-a83d-75d1-ab04-aeb54dc48027","argv":["node","packages/toy-mcp-server/server.js"],"cwd":"/home/asin/attestor","hostname":"Adarsh","os_…</td></tr>
+<tr><td>2</td><td>2026-07-26T23:54:06.785Z</td><td>wire</td><td></td><td class="p">{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"claude-code","version":"1.0"}}}</td></tr>
+<tr><td>3</td><td>2026-07-26T23:54:06.786Z</td><td>wire</td><td></td><td class="p">{"jsonrpc":"2.0","id":2,"method":"tools/list"}</td></tr>
+<tr><td>4</td><td>2026-07-26T23:54:06.786Z</td><td>call_request</td><td>echo</td><td class="p">{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"quarterly invoice reconciliation"}}}</td></tr>
+<tr><td>5</td><td>2026-07-26T23:54:06.786Z</td><td>call_request</td><td>echo</td><td class="p">{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"text":"payments.transfer 100.00 to acct-9"}}}</td></tr>
+<tr><td>6</td><td>2026-07-26T23:54:06.801Z</td><td>wire</td><td></td><td class="p">{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"toy-mcp-server","version":"0.0.0"}}}</td></tr>
+<tr><td>7</td><td>2026-07-26T23:54:06.802Z</td><td>wire</td><td></td><td class="p">{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echoes back the provided text.","inputSchema":{"type":"object","properties":{"text":…</td></tr>
+<tr><td>8</td><td>2026-07-26T23:54:06.802Z</td><td>call_result</td><td>echo</td><td class="p">{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"quarterly invoice reconciliation"}]}}</td></tr>
+<tr><td>9</td><td>2026-07-26T23:54:06.802Z</td><td>call_result</td><td>echo</td><td class="p">{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"payments.transfer 100.00 to acct-9"}]}}</td></tr>
+<tr><td>10</td><td>2026-07-26T23:54:06.803Z</td><td>session_end</td><td></td><td class="p"></td></tr>
+<tr><td>11</td><td>2026-07-26T23:54:06.804Z</td><td>checkpoint</td><td></td><td class="p">{"ledger_id":"019fa0d9-a83b-7c8e-a84a-2d98d4c089b7","tree_size":11,"root":"fa7d890ac6a9ed738bc242f82393632f04307f11f5808089e28dc8c296ee0922"}</td></tr>
+<tr><td>12</td><td>2026-07-26T23:54:07.923Z</td><td>anchor</td><td></td><td class="p">{"checkpoint_seq":11,"provider":"rekor-v1","uuid":"108e9186e8c5677af836f886410e1a2e74e05afd82b8b93f5dcf7e88246e429a5ca690d5d65b9273","logIndex":2256661985,"i…</td></tr>
+</table>

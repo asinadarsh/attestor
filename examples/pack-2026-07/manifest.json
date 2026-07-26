@@ -1,0 +1,35 @@
+{
+  "pack_version": 1,
+  "attestor_version": "0.1.0",
+  "generated_at": "2026-07-26T23:54:08.028Z",
+  "ledger_id": "019fa0d9-a83b-7c8e-a84a-2d98d4c089b7",
+  "entry_count": 13,
+  "session_count": 2,
+  "time_range": {
+    "from": "2026-07-26T23:54:06.779Z",
+    "to": "2026-07-26T23:54:07.923Z"
+  },
+  "recorder_key_ids": [
+    "6f3ab364bb0295b6"
+  ],
+  "verify_result_at_export": "VERIFIED",
+  "anchors": [
+    {
+      "checkpoint_seq": 11,
+      "uuid": "108e9186e8c5677af836f886410e1a2e74e05afd82b8b93f5dcf7e88246e429a5ca690d5d65b9273",
+      "log_index": 2256661985,
+      "integrated_time": 1785110047,
+      "rekor_url": "https://rekor.sigstore.dev",
+      "search_url": "https://search.sigstore.dev/?logIndex=2256661985"
+    }
+  ],
+  "files_sha256": {
+    "VERIFY.md": "b7f1271d46e790bcb780d5c28c78615fbc77d465d407672d059ae592934ee7a4",
+    "anchors/rekor/11.json": "f8ab2cc41cd7624d044af17e34dfd1c45c739e172554bc9c774def4f064228b5",
+    "controls/mapping.json": "e8af82cb23f82e976793dba08ca52be5017e9c24c05565d8f1edede263adba82",
+    "keys/recorder-pub.pem": "6ed3be93b993b1448c7715315de04e3b670c0728c3e2f9b55d52a3ad57680f22",
+    "keys/rekor-pub.pem": "dce5ef715502ec9f3cdfd11f8cc384b31a6141023d3e7595e9908a81cb6241bd",
+    "ledger/entries.jsonl": "03712fa65367e2fc93e880ffaac1f2999411ea76246b964af9bdca014ab3e326",
+    "report.html": "18f6841442d45ede6e21b021de2e44e93232fb44892f8ea7b75f2aed49069ad3"
+  }
+}

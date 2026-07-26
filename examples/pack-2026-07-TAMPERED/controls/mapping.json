@@ -1,0 +1,20 @@
+{
+  "disclaimer": "Attestor provides audit-trail evidence. Compliance determinations are made by your assessor. These mappings claim that the evidence pack SUPPORTS the listed controls — never that it makes you compliant or certified.",
+  "soc2_2017_tsc": {
+    "CC7.2": "Monitoring system components for anomalous activity — complete, tamper-evident record of agent tool calls.",
+    "CC7.3": "Evaluation of security events — verifiable reconstruction of what an agent did and when.",
+    "CC4.1": "Ongoing evaluations of internal control — verification is independently re-runnable by any party.",
+    "PI1.4_PI1.5": "Conditional (Processing Integrity in scope): complete, accurate retention of outputs/records with integrity proof."
+  },
+  "eu_ai_act": {
+    "Art. 12(1)": "Automatic recording of events (logs) over the system lifetime — directly supported, with tamper-evidence exceeding the bar.",
+    "Art. 12(2)(a)": "Recording the period of each use — per-call RFC 3339 timestamps (local-clock claims) plus Rekor integratedTime (trusted).",
+    "Art. 12(2)(b-d)": "Conditional — reference-database checks, input data, and human-verifier identity are populated only if the SDK user records those fields via record().",
+    "Art. 19 / Art. 26(6)": "Provider/deployer log retention — retention with independently verifiable integrity proof."
+  },
+  "hipaa_security_rule": {
+    "45 CFR 164.312(b)": "Audit controls — record and examine activity in systems containing ePHI.",
+    "45 CFR 164.308(a)(1)(ii)(D)": "Information system activity review.",
+    "45 CFR 164.312(c)(1)": "Integrity — applied to the audit trail itself (tamper-evident logs). No \"HIPAA certification\" exists; none is claimed."
+  }
+}
