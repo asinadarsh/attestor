@@ -13,6 +13,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -69,13 +70,15 @@ export function generateKey(
   return pair;
 }
 
+/** Key ids, oldest first (mtime order) — the last one is the active key. */
 export function listKeyIds(home: string = attestorHome()): string[] {
   const dir = keysDir(home);
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((f) => f.endsWith('.pem') && f !== 'rekor-pub.pem')
-    .map((f) => f.slice(0, -'.pem'.length))
-    .sort();
+    .map((f) => ({ id: f.slice(0, -'.pem'.length), mtime: statSync(join(dir, f)).mtimeMs }))
+    .sort((a, b) => a.mtime - b.mtime)
+    .map((k) => k.id);
 }
 
 export function loadKey(
