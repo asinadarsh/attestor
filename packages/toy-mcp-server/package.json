@@ -1,0 +1,9 @@
+{
+  "name": "toy-mcp-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "toy-mcp-server": "server.js"
+  }
+}

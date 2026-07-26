@@ -1,0 +1,11 @@
+{
+  "name": "attestor-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  }
+}

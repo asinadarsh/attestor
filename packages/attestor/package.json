@@ -1,0 +1,54 @@
+{
+  "name": "attestor",
+  "version": "0.1.0",
+  "description": "Tamper-evident flight recorder for AI agents: hash-chained tool-call ledger, Merkle checkpoints, Sigstore Rekor anchoring, verify CLI, evidence packs.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "attestor": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/sdk.d.ts",
+      "default": "./dist/sdk.js"
+    },
+    "./sdk": {
+      "types": "./dist/sdk.d.ts",
+      "default": "./dist/sdk.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --test-concurrency=1 test/",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "canonicalize": "3.0.0"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "0.115.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@sigstore/rekor-types": "5.0.0",
+    "@types/node": "^24",
+    "openai": "6.49.0",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "audit",
+    "tamper-evident",
+    "transparency-log",
+    "sigstore",
+    "rekor",
+    "mcp",
+    "ai-agents",
+    "compliance",
+    "merkle"
+  ]
+}
