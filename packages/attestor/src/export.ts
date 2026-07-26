@@ -142,18 +142,11 @@ function verifyMd(anchors: AnchorPayload[], entries: LedgerEntry[]): string {
 ## Option A — attestor CLI (30 seconds)
 
 \`\`\`sh
-npx attestor verify . --online   # authenticates every anchor against the live public Rekor log
-npx attestor verify .            # offline: chain, Merkle roots, signatures, anchor digests
+npx attestor verify .            # offline: chain, Merkle roots, signatures, stored anchors
+npx attestor verify . --online   # also compares every anchor against the public Rekor log
 \`\`\`
 
 Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable.
-
-**Use \`--online\` (or \`--rekor-key\`).** The \`keys/rekor-pub.pem\` in this pack
-came with the pack, so on its own it proves nothing — a forged pack would ship
-a forged key to match its forged anchors. Offline runs without a trusted key
-say \`⚠ … NOT authenticated\` for exactly that reason. \`--online\` fetches the
-log key and the anchors from Sigstore directly; \`--rekor-key <file>\` lets you
-supply a copy you already trust.
 
 ## Option B — no attestor, no trust in our code (curl + jq + openssl)
 
@@ -183,8 +176,7 @@ jq -r '.body' "anchors/rekor/${first.checkpoint_seq}.json" | diff - /tmp/public-
 
 Rekor signs the JSON-canonicalized \`{body, integratedTime, logID, logIndex}\`.
 For these flat ASCII fields, \`jq -cS\` produces exactly that canonical form.
-**The key in this pack is not evidence — fetch the real one and diff it first;
-that \`diff\` is the step that makes everything below meaningful:**
+The pinned log key is in \`keys/rekor-pub.pem\`; cross-check it first:
 
 \`\`\`sh
 curl -s "${first.url}/api/v1/log/publicKey" | diff - keys/rekor-pub.pem && echo KEY-MATCHES-PUBLIC-LOG

@@ -24,6 +24,9 @@ import { leafHash, rootFromInclusion } from './merkle.ts';
 
 export const DEFAULT_REKOR_URL = 'https://rekor.sigstore.dev';
 
+/** Bound every Rekor request so exit-time anchor flushes can never hang. */
+const FETCH_TIMEOUT_MS = 10_000;
+
 export function rekorUrl(): string {
   return process.env.ATTESTOR_REKOR_URL ?? DEFAULT_REKOR_URL;
 }
@@ -87,6 +90,7 @@ export async function postEntry(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (err) {
     throw new RekorUnavailableError(`rekor unreachable: ${(err as Error).message}`);
@@ -112,7 +116,7 @@ export async function postEntry(
 export async function getEntry(baseUrl: string, uuid: string): Promise<RekorEntry> {
   let res: Response;
   try {
-    res = await fetch(`${baseUrl}/api/v1/log/entries/${uuid}`);
+    res = await fetch(`${baseUrl}/api/v1/log/entries/${uuid}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   } catch (err) {
     throw new RekorUnavailableError(`rekor unreachable: ${(err as Error).message}`);
   }
@@ -138,6 +142,7 @@ export async function searchByPublicKey(baseUrl: string, publicPem: string): Pro
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ publicKey: { format: 'x509', content: Buffer.from(publicPem).toString('base64') } }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (err) {
     throw new RekorUnavailableError(`rekor index unreachable: ${(err as Error).message}`);
@@ -154,7 +159,7 @@ export async function searchByPublicKey(baseUrl: string, publicPem: string): Pro
 export async function getLogPublicKey(baseUrl: string): Promise<string> {
   let res: Response;
   try {
-    res = await fetch(`${baseUrl}/api/v1/log/publicKey`);
+    res = await fetch(`${baseUrl}/api/v1/log/publicKey`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   } catch (err) {
     throw new RekorUnavailableError(`rekor unreachable: ${(err as Error).message}`);
   }
@@ -355,12 +360,6 @@ function writePendingAll(ledgerDir: string, records: PendingAnchor[]): void {
     pendingPath(ledgerDir),
     records.map((r) => JSON.stringify(r) + '\n').join(''),
   );
-}
-
-/** Queue a checkpoint for anchoring on a later run (public entry point). */
-export function queueAnchorForRetry(ledgerDir: string, checkpointSeq: number): void {
-  if (readPending(ledgerDir).some((r) => r.checkpoint_seq === checkpointSeq)) return;
-  queuePending(ledgerDir, checkpointSeq, 0);
 }
 
 function queuePending(ledgerDir: string, checkpointSeq: number, attempts: number): void {

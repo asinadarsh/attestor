@@ -157,6 +157,36 @@ export function payloadHash(saltHex: string | undefined, payload: string | undef
   return h.digest('hex');
 }
 
+export interface GapNote {
+  unrecorded_lines: number;
+  from_ts?: string;
+  to_ts: string;
+}
+
+/**
+ * Persist a gap note when the ledger is unwritable at shutdown: the next
+ * successful open folds it into a signed `gap` entry, so a hole in the record
+ * can never disappear just because the process died while the disk was full.
+ */
+export function writeGapPending(dir: string, note: GapNote): void {
+  appendFileSync(join(dir, 'gap.pending'), JSON.stringify(note) + '\n');
+}
+
+export function readGapPending(dir: string): GapNote[] {
+  const p = join(dir, 'gap.pending');
+  if (!existsSync(p)) return [];
+  const out: GapNote[] = [];
+  for (const line of readFileSync(p, 'utf8').split('\n')) {
+    if (line === '') continue;
+    try {
+      out.push(JSON.parse(line) as GapNote);
+    } catch {
+      /* skip malformed note */
+    }
+  }
+  return out;
+}
+
 export function genesisPrev(ledgerId: string): string {
   return sha256Hex(`attestor-genesis:${ledgerId}`);
 }
@@ -284,6 +314,16 @@ export class Ledger {
           attestor_version: 1,
         }),
       });
+    }
+    // A previous run died while the ledger was unwritable — record the hole
+    // now that we can write again, before anything else lands in the chain.
+    for (const note of readGapPending(dir)) {
+      ledger.append({ type: 'gap', origin: 'system', payload: JSON.stringify(note) });
+    }
+    try {
+      unlinkSync(join(dir, 'gap.pending'));
+    } catch {
+      /* nothing pending */
     }
     return ledger;
   }

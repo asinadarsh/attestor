@@ -81,6 +81,10 @@ export interface VerifyOptions {
 
 interface ResolvedLedger {
   entries: LedgerEntry[];
+  /** Positions where a newline-terminated line failed to parse (tamper). */
+  unparsableAt: number[];
+  /** Bytes of a benign crash-torn unterminated trailing line. */
+  tornTailBytes: number;
   anchorFile: (checkpointSeq: number) => string | undefined;
   storedAnchorSeqs: number[];
   /** Rekor log key the auditor independently trusts (host-pinned). */
@@ -108,15 +112,24 @@ function resolveTarget(target: string): ResolvedLedger {
     throw new Error(`no ledger found at ${target} (expected ledger.jsonl or ledger/entries.jsonl)`);
   }
   const entries: LedgerEntry[] = [];
+  const unparsableAt: number[] = [];
+  let tornTailBytes = 0;
   const raw = readFileSync(ledgerPath, 'utf8');
-  let lineNo = 0;
-  for (const line of raw.split('\n')) {
-    lineNo++;
+  const segments = raw.split('\n');
+  const endsWithNewline = raw.endsWith('\n');
+  for (let i = 0; i < segments.length; i++) {
+    const line = segments[i]!;
     if (line === '') continue;
     try {
       entries.push(JSON.parse(line) as LedgerEntry);
     } catch {
-      throw new Error(`unparsable ledger line ${lineNo}`);
+      if (i === segments.length - 1 && !endsWithNewline) {
+        // crash-torn unterminated tail — benign; verify the intact prefix
+        tornTailBytes = Buffer.byteLength(line);
+      } else {
+        // a newline-terminated unparsable line is tamper, not an IO error
+        unparsableAt.push(entries.length);
+      }
     }
   }
   const anchorDirs = [join(base, 'anchors'), join(base, 'anchors', 'rekor')];
@@ -149,6 +162,8 @@ function resolveTarget(target: string): ResolvedLedger {
   }
   return {
     entries,
+    unparsableAt,
+    tornTailBytes,
     anchorFile,
     storedAnchorSeqs: [...new Set(storedAnchorSeqs)].sort((a, b) => a - b),
     trustedRekorPem,
@@ -170,10 +185,17 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       auditPacket: { error: (err as Error).message },
     };
   }
-  const { entries, anchorFile, storedAnchorSeqs } = resolved;
+  const { entries, anchorFile, storedAnchorSeqs, unparsableAt, tornTailBytes } = resolved;
   const findings: TamperFinding[] = [];
   const checks: CheckLine[] = [];
   const n = entries.length;
+  for (const at of unparsableAt) {
+    findings.push({
+      seq: Math.min(at, Math.max(n - 1, 0)),
+      check: 'CHAIN',
+      reason: `a newline-terminated ledger line near position ${at} is not valid JSON (corrupted or tampered)`,
+    });
+  }
 
   if (n === 0) {
     return {
@@ -278,7 +300,8 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     lines: chainOk
       ? [
           `${n.toLocaleString('en-US')} entries, hash chain intact` +
-            (redactedCount > 0 ? ` (${redactedCount} redacted payload${redactedCount === 1 ? '' : 's'})` : ''),
+            (redactedCount > 0 ? ` (${redactedCount} redacted payload${redactedCount === 1 ? '' : 's'})` : '') +
+            (tornTailBytes > 0 ? ` — ${tornTailBytes}-byte crash-torn partial tail ignored` : ''),
         ]
       : findingLines(findings, 'CHAIN'),
   });
@@ -474,13 +497,21 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
         /* unparsable pem already reported elsewhere */
       }
     }
-    // Authenticate the Rekor entry itself — only meaningful with a trusted key.
-    if (trustedRekorPem !== undefined) {
-      if (!verifySET(stored, trustedRekorPem)) {
+    // Two distinct questions, deliberately separated:
+    //   AUTHENTIC — signed by the real Rekor log? Needs a key the auditor
+    //     trusts independently (flag, or host pin). Only this proves anything.
+    //   CONSISTENT — does the anchor at least verify under the key shipped
+    //     alongside it? A mismatch is tamper regardless of trust; a match with
+    //     no trusted key proves nothing and is reported as unauthenticated.
+    const checkKey = trustedRekorPem ?? resolved.artifactRekorPem;
+    if (checkKey !== undefined) {
+      const trusted = trustedRekorPem !== undefined;
+      const under = trusted ? 'the trusted log key' : 'the log key shipped with this artifact';
+      if (!verifySET(stored, checkKey)) {
         findings.push({
           seq: a.seq,
           check: 'ANCHOR',
-          reason: `anchor ${a.seq}: Rekor SET signature invalid under the trusted log key (stored anchor forged?)`,
+          reason: `anchor ${a.seq}: Rekor SET signature invalid under ${under} (stored anchor forged?)`,
         });
         anchorFailures++;
         continue;
@@ -496,30 +527,71 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
         anchorFailures++;
         continue;
       }
-      if (!verifyCheckpointNote(proof, trustedRekorPem)) {
-        findings.push({ seq: a.seq, check: 'ANCHOR', reason: `anchor ${a.seq}: Rekor checkpoint note signature invalid` });
+      if (!verifyCheckpointNote(proof, checkKey)) {
+        findings.push({ seq: a.seq, check: 'ANCHOR', reason: `anchor ${a.seq}: Rekor checkpoint note signature invalid under ${under}` });
         anchorFailures++;
         continue;
       }
-      setChecked++;
+      if (trusted) setChecked++;
+      else unauthenticated++;
     } else {
-      // digest matched our recomputed checkpoint, but we cannot prove the
-      // anchor is genuinely in the public log without a trusted key.
+      // digest matched our recomputed checkpoint, but nothing authenticates it
       unauthenticated++;
     }
   }
-  // Orphaned stored anchors: a Rekor entry exists on disk for a checkpoint
-  // seq that is no longer in the ledger → tail was truncated past an anchor.
+  // Stored-anchor sweep — driven by the FILES on disk, never by what the
+  // ledger chooses to declare. Deleting the `anchor` entry (or truncating past
+  // it) must not downgrade a rewritten ledger to "no anchors recorded": every
+  // anchor file is an independent commitment that the checkpoint at that seq
+  // hashed to a specific value.
+  const declaredCheckpointSeqs = new Set(anchors.map((a) => a.payload.checkpoint_seq));
   for (const seq of storedAnchorSeqs) {
-    const inLedger = entries[seq]?.type === 'checkpoint';
-    if (!inLedger) {
+    if (declaredCheckpointSeqs.has(seq)) continue; // already fully checked above
+    const file = anchorFile(seq);
+    if (file === undefined) continue;
+    let storedDigest: string | undefined;
+    let stored: RekorEntry | undefined;
+    try {
+      stored = JSON.parse(readFileSync(file, 'utf8')) as RekorEntry;
+      storedDigest = (JSON.parse(Buffer.from(stored.body, 'base64').toString('utf8')) as {
+        spec?: { data?: { hash?: { value?: string } } };
+      }).spec?.data?.hash?.value;
+    } catch {
+      /* undecodable — reported below */
+    }
+    const ckpt = entries[seq];
+    if (ckpt === undefined || ckpt.type !== 'checkpoint') {
       findings.push({
         seq: Math.min(seq, n - 1),
         check: 'ANCHOR',
-        reason: `stored Rekor anchor exists for checkpoint seq ${seq}, but the ledger ${seq >= n ? `ends at seq ${n - 1}` : 'has no checkpoint there'} (post-anchor truncation)`,
+        reason: `a Rekor anchor is stored for checkpoint seq ${seq}, but the ledger ${seq >= n ? `ends at seq ${n - 1}` : 'has no checkpoint there'} — history was truncated past an anchor`,
       });
       anchorFailures++;
+      continue;
     }
+    if (storedDigest === undefined) {
+      findings.push({ seq, check: 'ANCHOR', reason: `stored Rekor anchor for checkpoint ${seq} is undecodable` });
+      anchorFailures++;
+      continue;
+    }
+    if (storedDigest !== recomputed[seq]) {
+      findings.push({
+        seq,
+        check: 'ANCHOR',
+        reason: `checkpoint ${seq} does not match the anchor stored for it (the ledger's own \`anchor\` entry is missing — deleted to hide a rewrite?)`,
+        expected: storedDigest,
+        got: recomputed[seq],
+      });
+      anchorFailures++;
+      continue;
+    }
+    // digest matches but the chain no longer records the anchoring event
+    findings.push({
+      seq,
+      check: 'ANCHOR',
+      reason: `checkpoint ${seq} has a stored Rekor anchor but no \`anchor\` entry in the chain (entry deleted)`,
+    });
+    anchorFailures++;
   }
   const anchorOk = anchorFailures === 0;
   const anchorWarn = anchorOk && unauthenticated > 0;
@@ -647,7 +719,9 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
   let entryFocus: VerifyReport['entryFocus'];
   if (opts.entry !== undefined) {
     const seq = opts.entry;
-    if (seq < 0 || seq >= n) {
+    if (!Number.isInteger(seq)) {
+      entryFocus = { seq, ok: false, note: `--entry must be an integer, got "${String(seq)}"` };
+    } else if (seq < 0 || seq >= n) {
       entryFocus = { seq, ok: false, note: `entry ${seq} out of range [0, ${n})` };
     } else {
       // nearest checkpoint whose tree covers this entry, preferring an anchored one

@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 // attestor CLI: keys, wrap, install, verify, export, redact, replay, demo.
 import { parseArgs } from 'node:util';
-import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { attestorHome, generateKey, listKeyIds, loadKey } from './keys.ts';
 import { Ledger, readEntries, uuidv7, type LedgerEntry } from './ledger.ts';
 import { Checkpointer, lastCheckpointSize } from './checkpoint.ts';
-import { anchorCheckpoint, queueAnchorForRetry, retryPending } from './rekor.ts';
+import { anchorCheckpoint, retryPending } from './rekor.ts';
 import { renderReport, verifyLedger } from './verify.ts';
 import { runProxy } from './proxy.ts';
 
@@ -41,18 +40,8 @@ function fail(msg: string): never {
   process.exit(2);
 }
 
-/**
- * Ledger directory. A ledger has a single writer (O_EXCL lockfile), so each
- * wrapped server gets its own — otherwise Claude Desktop launching two servers
- * concurrently would leave all but one attestor dead on "ledger locked".
- */
-function defaultLedgerDir(command?: string, args: string[] = []): string {
-  if (command === undefined) return join(attestorHome(), 'ledgers', 'default');
-  const label = [command, ...args].join(' ');
-  const slug =
-    basename(command).replace(/[^a-zA-Z0-9._-]/g, '') || 'server';
-  const digest = createHash('sha256').update(label).digest('hex').slice(0, 8);
-  return join(attestorHome(), 'ledgers', `${slug}-${digest}`);
+function defaultLedgerDir(): string {
+  return join(attestorHome(), 'ledgers', 'default');
 }
 
 function loadOrInitKeys(passphrase?: string) {
@@ -122,6 +111,7 @@ async function cmdWrap(argv: string[]): Promise<void> {
     args: argv.slice(0, sep),
     options: {
       ledger: { type: 'string' },
+      'ledger-name': { type: 'string' },
       'on-error': { type: 'string', default: 'block' },
       durability: { type: 'string', default: 'strict' },
       offline: { type: 'boolean', default: false },
@@ -136,65 +126,67 @@ async function cmdWrap(argv: string[]): Promise<void> {
   if (!['strict', 'group'].includes(durability)) fail(`--durability must be strict|group`);
 
   const keys = loadOrInitKeys(readPassphrase(values['passphrase-file']));
-  const dir = values.ledger ?? defaultLedgerDir(command, args);
+  const dir =
+    values.ledger ??
+    (values['ledger-name'] !== undefined
+      ? join(attestorHome(), 'ledgers', values['ledger-name'])
+      : defaultLedgerDir());
   const ledger = Ledger.open(dir, keys, { durability });
   if (ledger.tornRecovery.recovered) {
     process.stderr.write(`[attestor] recovered torn tail (${ledger.tornRecovery.tornBytes} bytes → ledger.torn)\n`);
   }
   const offline = values.offline || process.env.ATTESTOR_OFFLINE === '1';
-  // Track in-flight anchors so shutdown can await them instead of racing a
-  // fixed sleep — otherwise the final checkpoint's anchor is lost entirely.
+  // Track every in-flight anchor so exit can await them: dropping one loses
+  // the external-anchoring guarantee for that checkpoint with no pending-queue
+  // trace (anchorCheckpoint only queues on a network error, not on process death).
   const inFlight = new Set<Promise<unknown>>();
+  const track = (p: Promise<unknown>) => {
+    inFlight.add(p);
+    void p.finally(() => inFlight.delete(p));
+  };
   const checkpointer = new Checkpointer(ledger, {
     initialCoveredSize: lastCheckpointSize(readEntries(join(dir, 'ledger.jsonl'))),
     onCheckpoint: (entry) => {
-      const p = anchorCheckpoint(ledger, entry, { offline })
-        .catch((err) => process.stderr.write(`[attestor] anchor failed: ${(err as Error).message}\n`))
-        .finally(() => inFlight.delete(p));
-      inFlight.add(p);
+      track(
+        anchorCheckpoint(ledger, entry, { offline }).catch((err) =>
+          process.stderr.write(`[attestor] anchor failed: ${(err as Error).message}\n`),
+        ),
+      );
     },
   });
   if (!offline) {
-    const p = retryPending(ledger)
-      .catch(() => {})
-      .finally(() => inFlight.delete(p));
-    inFlight.add(p);
+    track(retryPending(ledger).catch(() => {}));
   }
   const code = await runProxy({ ledger, checkpointer, command, args, onError, handleSignals: true });
-  // Drain in-flight anchors, but never hang a shutdown on a slow log: whatever
-  // has not landed by the deadline is queued for the next run to retry.
-  const drained = await Promise.race([
-    Promise.allSettled([...inFlight]).then(() => true),
-    new Promise<boolean>((r) => setTimeout(() => r(false), 5_000).unref?.()),
-  ]);
-  if (!drained) {
-    for (const seq of pendingCheckpointSeqs(ledger, dir)) queueAnchorForRetry(dir, seq);
-    process.stderr.write('[attestor] anchor still in flight at exit — queued for retry\n');
+  // Drain in-flight anchors before closing the ledger (each Rekor request is
+  // itself bounded by a 10s timeout, so this cannot hang indefinitely).
+  while (inFlight.size > 0) {
+    await Promise.allSettled([...inFlight]);
   }
   ledger.close();
   process.exit(code);
-}
-
-/** Checkpoints with no matching anchor entry and no stored anchor file. */
-function pendingCheckpointSeqs(ledger: Ledger, dir: string): number[] {
-  const entries = readEntries(join(dir, 'ledger.jsonl'));
-  const anchored = new Set<number>();
-  for (const e of entries) {
-    if (e.type === 'anchor' && e.payload !== undefined) {
-      try {
-        anchored.add((JSON.parse(e.payload) as { checkpoint_seq: number }).checkpoint_seq);
-      } catch {
-        /* verify reports malformed anchors */
-      }
-    }
-  }
-  return entries.filter((e) => e.type === 'checkpoint' && !anchored.has(e.seq)).map((e) => e.seq);
 }
 
 interface McpServerDef {
   command: string;
   args?: string[];
   [k: string]: unknown;
+}
+
+/** Already wrapped? Match the binary in any spelling, or an existing wrap argv. */
+function isAlreadyWrapped(def: McpServerDef): boolean {
+  const cmd = (def.command ?? '').replace(/\\/g, '/');
+  const base = cmd.slice(cmd.lastIndexOf('/') + 1).toLowerCase();
+  if (base === 'attestor' || base === 'attestor.cmd' || base === 'attestor.exe') return true;
+  const args = def.args ?? [];
+  // `npx attestor wrap …`, `node …/cli.js wrap …`
+  return args.some((a, i) => a === 'wrap' && args.slice(0, i).some((p) => /attestor/i.test(p)));
+}
+
+/** Slugify a server name into a filesystem-safe ledger directory name. */
+function ledgerSlug(name: string): string {
+  const slug = name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug === '' ? 'server' : slug;
 }
 
 export function wrapConfig(config: { mcpServers?: Record<string, McpServerDef> }): {
@@ -204,11 +196,14 @@ export function wrapConfig(config: { mcpServers?: Record<string, McpServerDef> }
   const changed: string[] = [];
   const skipped: string[] = [];
   for (const [name, def] of Object.entries(config.mcpServers ?? {})) {
-    if (def.command === 'attestor' || (def.command?.endsWith('/attestor') ?? false)) {
+    if (isAlreadyWrapped(def)) {
       skipped.push(name);
       continue;
     }
-    def.args = ['wrap', '--', def.command, ...(def.args ?? [])];
+    // Each server gets its OWN ledger: the single-writer lockfile means a
+    // shared default dir would let the first server start and every other one
+    // die with "ledger locked by pid N".
+    def.args = ['wrap', '--ledger-name', ledgerSlug(name), '--', def.command, ...(def.args ?? [])];
     def.command = 'attestor';
     changed.push(name);
   }
@@ -258,19 +253,12 @@ async function cmdVerify(argv: string[]): Promise<void> {
       online: { type: 'boolean', default: false },
       entry: { type: 'string' },
       json: { type: 'boolean', default: false },
-      'rekor-url': { type: 'string' },
-      'rekor-key': { type: 'string' },
     },
   });
   const target = positionals[0] ?? defaultLedgerDir();
-  if (values.entry !== undefined && !/^\d+$/.test(values.entry)) {
-    fail(`--entry must be a non-negative integer, got "${values.entry}"`);
-  }
   const report = await verifyLedger(target, {
     online: values.online,
     ...(values.entry !== undefined && { entry: Number(values.entry) }),
-    ...(values['rekor-url'] !== undefined && { rekorUrl: values['rekor-url'] }),
-    ...(values['rekor-key'] !== undefined && { rekorPubPem: readFileSync(values['rekor-key'], 'utf8') }),
   });
   if (values.json) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');
@@ -295,17 +283,21 @@ async function cmdReplay(argv: string[]): Promise<void> {
   const entries = readEntries(path).filter(
     (e) => values.session === undefined || e.session_id === values.session,
   );
-  // Pair within a session: proxy call_ids are JSON-RPC ids that restart at 1
-  // every session, so a bare call_id would pair across sessions.
+  // Pair within a session: proxy call_ids ("c2s:1", "c2s:2", …) restart at 1
+  // every session, so a bare call_id would pair a result with another
+  // session's request. Walk in order and consume each request once.
   const requests = new Map<string, LedgerEntry>();
-  const pairKey = (e: LedgerEntry): string => `${e.session_id} ${e.call_id}`;
+  const key = (e: LedgerEntry) => `${e.session_id} ${e.call_id}`;
   for (const e of entries) {
-    if (e.type === 'call_request' && e.call_id !== undefined) requests.set(pairKey(e), e);
+    if (e.type === 'call_request' && e.call_id !== undefined && !requests.has(key(e))) {
+      requests.set(key(e), e);
+    }
   }
   for (const e of entries) {
     if (e.type !== 'call_result' || e.call_id === undefined) continue;
-    const req = requests.get(pairKey(e));
+    const req = requests.get(key(e));
     if (!req) continue;
+    requests.delete(key(e));
     const durationMs = Date.parse(e.ts) - Date.parse(req.ts);
     const show = (entry: LedgerEntry) =>
       entry.payload === undefined ? `[REDACTED payload_hash=${entry.payload_hash.slice(0, 16)}…]` : entry.payload;

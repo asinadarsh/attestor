@@ -16,7 +16,7 @@ import { hostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
 import type { Checkpointer } from './checkpoint.ts';
 import type { Ledger } from './ledger.ts';
-import { uuidv7 } from './ledger.ts';
+import { uuidv7, writeGapPending } from './ledger.ts';
 
 export interface ProxyOptions {
   ledger: Ledger;
@@ -38,10 +38,8 @@ interface PendingCall {
 
 export interface LineSplitter {
   (chunk: Buffer): void;
-  /** Bytes received after the last newline (never framed). */
-  partial(): Buffer;
-  /** Take and clear the unterminated tail. */
-  takePartial(): Buffer;
+  /** Return any buffered unterminated tail (and clear it). */
+  flush(): Buffer;
 }
 
 /** Split a byte stream into newline-framed lines, preserving exact bytes. */
@@ -57,11 +55,10 @@ export function lineSplitter(onLine: (line: Buffer) => void): LineSplitter {
     }
     rest = data;
   }) as LineSplitter;
-  feed.partial = () => rest;
-  feed.takePartial = () => {
-    const p = rest;
+  feed.flush = () => {
+    const out = rest;
     rest = Buffer.alloc(0);
-    return p;
+    return out;
   };
   return feed;
 }
@@ -175,24 +172,32 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
   return new Promise<number>((resolve) => {
     let settled = false;
     let finalized = false;
-    // assigned once the splitters exist; finalize() may run before that
-    let flushPartials = (): void => {};
     // Synchronous final writes — safe to run from a signal handler, because
     // ledger appends are sync (writeSync + fsync).
     const finalize = () => {
       if (finalized) return;
       finalized = true;
-      // Flush any bytes not terminated by a newline — the peer transmitted
-      // them, so they belong in the record even though they never framed.
-      flushPartials();
       record({ type: 'session_end', origin: 'proxy' });
       try {
         checkpointer.checkpointNow();
       } catch (err) {
-        // a broken ledger must not throw out of a signal handler
         diag(`final checkpoint failed: ${(err as Error).message}`);
       }
       checkpointer.stop();
+      if (gapCount > 0) {
+        // ledger never recovered: leave a durable side-note so the NEXT open
+        // appends a signed gap marker — the hole must not vanish silently.
+        try {
+          writeGapPending(ledger.dir, {
+            unrecorded_lines: gapCount,
+            from_ts: gapFrom,
+            to_ts: new Date().toISOString(),
+          });
+          diag(`ledger still unwritable at exit — ${gapCount} unrecorded lines noted in gap.pending`);
+        } catch (err) {
+          diag(`could not persist gap note: ${(err as Error).message}`);
+        }
+      }
     };
     const finish = (code: number) => {
       if (settled) return;
@@ -217,59 +222,53 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
       diag(`failed to spawn ${opts.command}: ${err.message}`);
       finish(127);
     });
-    // A child that has exited makes writes raise EPIPE/ERR_STREAM_DESTROYED as
-    // an 'error' event; without a handler that crashes the proxy.
-    child.stdin.on('error', (err) => diag(`child stdin error: ${err.message}`));
 
-    /** Forward to the child, surviving a dead pipe. */
-    const writeToChild = (buf: Buffer): void => {
-      if (child.stdin.destroyed || child.stdin.writableEnded) {
-        diag('child stdin closed — request could not be delivered');
-        return;
-      }
-      try {
-        child.stdin.write(buf);
-      } catch (err) {
-        diag(`child stdin write failed: ${(err as Error).message}`);
-      }
-    };
+    // ignore late writes after the child died — EPIPE here must not crash the
+    // proxy (the request was already recorded before forwarding)
+    child.stdin.on('error', (err) => {
+      diag(`child stdin closed: ${err.message}`);
+    });
 
+    // call_id namespace is keyed by the REQUESTER's direction: a c2s request
+    // and the s2c response answering it share `c2s:<id>`; a server-initiated
+    // (s2c) request and the client's reply share `s2c:<id>`.
     // ---- client → server ----
     const c2s = lineSplitter((line) => {
       const meta = classifyLine(line);
       const payload = line.toString('utf8');
+      const callId = meta.id !== undefined ? (meta.kind === 'response' ? `s2c:${meta.id}` : `c2s:${meta.id}`) : undefined;
       const entryInput = {
         type: meta.kind === 'request' && meta.method === 'tools/call' ? ('call_request' as const) : ('wire' as const),
         origin: 'proxy' as const,
         direction: 'c2s' as const,
         payload,
-        ...(meta.id !== undefined && { call_id: `c2s:${meta.id}` }),
+        ...(callId !== undefined && { call_id: callId }),
         ...(meta.toolName !== undefined && { tool: { server: serverName, name: meta.toolName } }),
       };
       const recorded = record(entryInput);
-      if (!recorded && onError === 'block') {
-        if (meta.kind === 'request') {
-          // fail the call loudly instead of forwarding unrecorded traffic
-          let id: unknown = meta.id;
-          try {
-            id = (JSON.parse(payload) as { id?: unknown }).id;
-          } catch {
-            /* meta.id stands */
-          }
-          stdout.write(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              id,
-              error: { code: -32000, message: 'attestor: audit ledger unavailable — call blocked (on-error=block)' },
-            }) + '\n',
-          );
-          return;
+      if (!recorded && onError === 'block' && meta.kind === 'request') {
+        // fail the NEW call loudly instead of forwarding unrecorded traffic.
+        // Responses and notifications still flow (below): a response answers a
+        // server-initiated request whose action is already in motion — dropping
+        // it would wedge the session without preventing anything; the loss is
+        // accounted for by the gap counter.
+        let id: unknown = meta.id;
+        try {
+          id = (JSON.parse(payload) as { id?: unknown }).id;
+        } catch {
+          /* meta.id stands */
         }
-        // Responses to server-initiated requests (sampling/elicitation) and
-        // protocol notifications must still flow: dropping them wedges the
-        // session forever with no error anyone can see. Forward, and let the
-        // gap marker record that these bytes went unrecorded.
-        diag(`relaying unrecordable ${meta.kind} (blocking it would wedge the session; covered by gap marker)`);
+        stdout.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            error: { code: -32000, message: 'attestor: audit ledger unavailable — call blocked (on-error=block)' },
+          }) + '\n',
+        );
+        return;
+      }
+      if (!recorded && onError === 'block') {
+        diag(`relaying unrecorded ${meta.kind} while ledger is down (counted in gap)`);
       }
       if (meta.kind === 'request') {
         pendingCalls.set(meta.id!, {
@@ -277,7 +276,7 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
           startedAt: Date.now(),
         });
       }
-      writeToChild(Buffer.concat([line, Buffer.from('\n')]));
+      child.stdin.write(Buffer.concat([line, Buffer.from('\n')]));
     });
 
     // ---- server → client ----
@@ -285,12 +284,14 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
       const meta = classifyLine(line);
       const pending = meta.kind === 'response' && meta.id !== undefined ? pendingCalls.get(meta.id) : undefined;
       if (meta.kind === 'response' && meta.id !== undefined) pendingCalls.delete(meta.id);
+      const callId =
+        meta.id !== undefined ? (meta.kind === 'request' ? `s2c:${meta.id}` : `c2s:${meta.id}`) : undefined;
       record({
         type: pending?.tool !== undefined ? 'call_result' : 'wire',
         origin: 'proxy',
         direction: 's2c',
         payload: line.toString('utf8'),
-        ...(meta.id !== undefined && { call_id: `c2s:${meta.id}` }),
+        ...(callId !== undefined && { call_id: callId }),
         ...(pending?.tool !== undefined && { tool: { server: serverName, name: pending.tool } }),
       });
       // s2c always forwarded — the action already happened server-side;
@@ -298,37 +299,22 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
       stdout.write(Buffer.concat([line, Buffer.from('\n')]));
     });
 
-    // Record any bytes the peers sent that never got a terminating newline —
-    // a crashed server's partial write is evidence, not something to discard.
-    flushPartials = () => {
-      for (const [splitter, direction] of [
-        [c2s, 'c2s'],
-        [s2c, 's2c'],
-      ] as const) {
-        const partial = splitter.takePartial();
-        if (partial.length === 0) continue;
-        record({
-          type: 'wire',
-          origin: 'proxy',
-          direction,
-          payload: partial.toString('utf8'),
-        });
-        diag(`recorded ${partial.length} unterminated ${direction} byte(s) at shutdown`);
-      }
+    // an unterminated tail is still bytes that were transmitted: relay AND record
+    const flushTail = (splitter: LineSplitter, dest: NodeJS.WritableStream | null, direction: 'c2s' | 's2c') => {
+      const tail = splitter.flush();
+      if (tail.length === 0) return;
+      record({ type: 'wire', origin: 'proxy', direction, payload: tail.toString('utf8') });
+      dest?.write(tail);
     };
 
     stdin.on('data', c2s);
     stdin.on('end', () => {
-      try {
-        child.stdin.end();
-      } catch {
-        /* child already gone */
-      }
+      flushTail(c2s, child.stdin.destroyed ? null : child.stdin, 'c2s');
+      child.stdin.end();
     });
-    stdin.on('error', (err) => diag(`stdin error: ${err.message}`));
     child.stdout.on('data', s2c);
-    child.stdout.on('error', (err) => diag(`child stdout error: ${err.message}`));
     child.on('close', (code, signal) => {
+      flushTail(s2c, stdout, 's2c');
       finish(code ?? (signal ? 128 + 15 : 0));
     });
   });

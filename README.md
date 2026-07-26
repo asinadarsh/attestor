@@ -67,24 +67,13 @@ OpenAI `tool_calls` + `function_call` structures, streaming or not.
 ## Verify
 
 ```sh
-attestor verify <dir>                       # CHAIN → MERKLE → SIG → ANCHOR, offline
-attestor verify <dir> --rekor-key rekor.pem # authenticate anchors against a key YOU trust
-attestor verify <dir> --online              # + compare against the live public Rekor log
+attestor verify <dir>            # CHAIN → MERKLE → SIG → ANCHOR, offline
+attestor verify <dir> --online   # + compare every anchor against the public Rekor log
 ```
 
 Exit codes: `0` verified · `1` tamper · `2` usage/IO error · `3` Rekor
 unreachable (CI can tell network from tamper). On tamper you get the entry,
 the reason, the blast radius, and an `audit-packet.json`.
-
-**Where the trust comes from.** A Rekor log key shipped *inside* an evidence
-pack cannot authenticate that pack — an attacker who forges anchors ships a
-matching key. So attestor only authenticates anchors against a key you supply
-(`--rekor-key`) or one pinned in your own `~/.attestor/keys/`; anything else
-is reported as `⚠ ANCHOR … NOT authenticated`, never as verified. `--online`
-goes further: it fetches the log key and every anchor from *your* Rekor URL
-(never the one embedded in the ledger), and searches the public log by
-recorder pubkey — so anchors the attacker deleted locally still surface as
-evidence that history was longer.
 
 ## Evidence packs
 
@@ -107,8 +96,7 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
 | Delete a middle entry | `prev` mismatch + `seq` gap | ✅ |
 | Reorder entries | `prev` chain + `seq` | ✅ |
 | Truncate tail (delete newest) | chain stays valid locally; signed checkpoint anchored in Rekor at size *N* proves the log was longer. **Window: entries since last anchor are silently truncatable** | ✅ post-anchor / ⚠️ ≤60 s window |
-| Fork/rollback (show auditor an alternate history) | `verify --online` authenticates every anchor against the live log key and searches Rekor by recorder pubkey, so anchors deleted from the local copy still surface | ✅ if verifier queries Rekor |
-| Forge an evidence pack (anchors + a matching "Rekor" key) | anchors are only authenticated against an auditor-supplied or host-pinned log key; an artifact-supplied key is reported unauthenticated, never verified | ✅ with `--rekor-key` / `--online` |
+| Fork/rollback (show auditor an alternate history) | two Rekor entries under the same `ledger_id`+pubkey with inconsistent roots = cryptographic fork proof; `verify --online` compares anchored checkpoints against the public log | ✅ if verifier queries Rekor |
 | Steal signing key (disk access) | cannot rewrite anchored history without Rekor collusion; **can** forge/fork from theft onward. Rotation bounds blast radius | ⚠️ partial — forward forgery out of scope |
 | Root on host *during* recording | nothing — recorder signs what it saw; lies fed to it are faithfully attested | ❌ out of scope, say so |
 | Delete entire ledger | Rekor entries under the pubkey survive as existence evidence; absence of a ledger proves nothing about activity | ⚠️ detection only |
@@ -156,11 +144,8 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
   `payload_hash = SHA256(salt ‖ bytes)`, which eliminates the JCS float/
   surrogate attack surface structurally and makes redaction possible:
   `attestor redact <seq>` strips a payload while chain, sigs, roots, and
-  anchors stay valid. The 16-byte salt is itself unsigned and is deleted along
-  with the payload — so after redaction only `payload_hash` survives and a
-  low-entropy payload cannot be brute-forced. System payloads (genesis,
-  checkpoint, anchor, key_rotation, and `gap` markers) are never redactable:
-  stripping one is reported as tamper, not redaction.
+  anchors stay valid; the 16-byte salt defeats brute-force on low-entropy
+  redacted payloads.
 - **Storage**: append-only JSONL — the ledger file *is* the exhibit. An
   auditor can `jq` it and re-hash it with a 50-line script in any language.
   Torn final lines (crash) are moved to `ledger.torn`; a newline-terminated
