@@ -217,6 +217,95 @@ test('continue mode: traffic relayed during outage, signed gap marker on recover
   assert.equal(report.exitCode, 0);
 });
 
+test('block mode relays (not drops) responses + notifications so the session never wedges', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(join(dir, 'ledger'), keys);
+  const ckpt = new Checkpointer(ledger, { idleMs: 3600_000 });
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const realAppend = ledger.append.bind(ledger);
+  let broken = false;
+  (ledger as { append: typeof ledger.append }).append = (input, s) => {
+    if (broken) throw new Error('disk full (injected)');
+    return realAppend(input, s);
+  };
+  const done = runProxy({
+    ledger,
+    checkpointer: ckpt,
+    command: process.execPath,
+    args: ['-e', 'process.stdin.pipe(process.stdout)'],
+    onError: 'block',
+    stdin,
+    stdout,
+    stderr: new PassThrough(),
+  });
+  broken = true;
+  // a reply to a server-initiated request, and a protocol notification
+  stdin.write('{"jsonrpc":"2.0","id":"srv-1","result":{"model":"x"}}\n');
+  stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
+  await sleep(200);
+  const out = stdout.read()?.toString() ?? '';
+  assert.ok(out.includes('srv-1'), 'response to server request must still flow');
+  assert.ok(out.includes('notifications/initialized'), 'notification must still flow');
+  broken = false;
+  stdin.end();
+  await done;
+  ledger.close();
+  // and the hole is on record
+  const entries = readEntries(join(dir, 'ledger', 'ledger.jsonl'));
+  assert.ok(entries.some((e) => e.type === 'gap'), 'unrecorded traffic leaves a gap marker');
+});
+
+test('unterminated final bytes are recorded at shutdown, not silently dropped', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(join(dir, 'ledger'), keys);
+  const ckpt = new Checkpointer(ledger, { idleMs: 3600_000 });
+  const stdin = new PassThrough();
+  const done = runProxy({
+    ledger,
+    checkpointer: ckpt,
+    command: process.execPath,
+    // child emits a partial line with no trailing newline, then exits
+    args: ['-e', 'process.stdout.write(\'{"jsonrpc":"2.0","id":9,"resu\')'],
+    stdin,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  });
+  await done;
+  ledger.close();
+  const entries = readEntries(join(dir, 'ledger', 'ledger.jsonl'));
+  assert.ok(
+    entries.some((e) => e.payload === '{"jsonrpc":"2.0","id":9,"resu'),
+    'partial transmitted bytes must be on record',
+  );
+});
+
+test('writes to a dead child do not crash the proxy', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const ledger = Ledger.open(join(dir, 'ledger'), keys);
+  const ckpt = new Checkpointer(ledger, { idleMs: 3600_000 });
+  const stdin = new PassThrough();
+  const done = runProxy({
+    ledger,
+    checkpointer: ckpt,
+    command: process.execPath,
+    args: ['-e', 'process.exit(0)'], // exits immediately
+    stdin,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  });
+  await sleep(150);
+  stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n'); // EPIPE territory
+  await sleep(100);
+  stdin.end();
+  const code = await done; // must resolve, not throw
+  assert.equal(typeof code, 'number');
+  ledger.close();
+});
+
 test('lineSplitter preserves exact bytes across chunk boundaries', () => {
   const lines: string[] = [];
   const feed = lineSplitter((l) => lines.push(l.toString('utf8')));

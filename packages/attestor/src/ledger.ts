@@ -42,12 +42,17 @@ export type EntryType =
 
 export type Origin = 'proxy' | 'sdk' | 'manual' | 'system';
 
-/** Entry types whose payload is load-bearing for verification — never redactable. */
+/**
+ * Entry types whose payload is load-bearing for verification — never
+ * redactable. `gap` is here because its payload documents unrecorded traffic:
+ * redacting it would erase evidence of a hole in the record.
+ */
 export const SYSTEM_TYPES: ReadonlySet<EntryType> = new Set([
   'genesis',
   'checkpoint',
   'anchor',
   'key_rotation',
+  'gap',
 ]);
 
 export interface SignedCore {
@@ -61,13 +66,18 @@ export interface SignedCore {
   origin: Origin;
   actor?: Record<string, string>;
   tool?: Record<string, string>;
-  salt: string;
   payload_hash: string;
   prev: string;
   key_id: string;
 }
 
 export interface LedgerEntry extends SignedCore {
+  /**
+   * 16-byte hex salt. UNSIGNED and dropped by redaction alongside `payload`,
+   * so that after redaction only the signed `payload_hash = SHA256(salt‖bytes)`
+   * remains — with the salt gone, a low-entropy payload cannot be brute-forced.
+   */
+  salt?: string;
   /** Exact wire/body bytes as a JSON string. Unsigned; strippable by redact. */
   payload?: string;
   /** hex SHA256(JCS(core)) — chain link. */
@@ -87,11 +97,19 @@ const CORE_FIELDS = [
   'origin',
   'actor',
   'tool',
-  'salt',
   'payload_hash',
   'prev',
   'key_id',
 ] as const;
+
+/** Every legal top-level key on a ledger line (core + unsigned siblings). */
+export const KNOWN_ENTRY_KEYS: ReadonlySet<string> = new Set([
+  ...CORE_FIELDS,
+  'salt',
+  'payload',
+  'hash',
+  'sig',
+]);
 
 export function coreOf(entry: Record<string, unknown>): SignedCore {
   const core: Record<string, unknown> = {};
@@ -132,9 +150,9 @@ export function verifyCoreSig(core: SignedCore, sigB64: string, publicKey: KeyOb
   }
 }
 
-export function payloadHash(saltHex: string, payload: string | undefined): string {
+export function payloadHash(saltHex: string | undefined, payload: string | undefined): string {
   const h = createHash('sha256');
-  h.update(Buffer.from(saltHex, 'hex'));
+  if (saltHex !== undefined) h.update(Buffer.from(saltHex, 'hex'));
   if (payload !== undefined) h.update(Buffer.from(payload, 'utf8'));
   return h.digest('hex');
 }
@@ -292,15 +310,16 @@ export class Ledger {
       origin: input.origin ?? 'system',
       ...(input.actor !== undefined && { actor: input.actor }),
       ...(input.tool !== undefined && { tool: input.tool }),
-      salt,
       payload_hash: payloadHash(salt, input.payload),
       prev: this.lastHash,
       key_id: this.keys.keyId,
     };
     const hash = hashCore(core);
     const sig = signCore(core, this.keys.privateKey);
+    // salt is UNSIGNED (payload_hash in the core binds it); redaction drops it.
     const entry: LedgerEntry = {
       ...core,
+      salt,
       ...(input.payload !== undefined && { payload: input.payload }),
       hash,
       sig,

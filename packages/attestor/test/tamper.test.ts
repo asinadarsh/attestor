@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { generateKeyPairSync, sign as cryptoSign, createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
 import { verifyLedger } from '../src/verify.ts';
-import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, type LedgerEntry } from '../src/ledger.ts';
+import { coreOf, hashCore, readEntries, signCore, genesisPrev, type LedgerEntry } from '../src/ledger.ts';
 import { keyIdOf } from '../src/keys.ts';
 import { hashedRekordBody } from '../src/rekor.ts';
 import { leafHash } from '../src/merkle.ts';
@@ -23,11 +23,26 @@ function writeLines(ledgerDir: string, lines: string[]): void {
 }
 
 test('pristine anchored ledger verifies: exit 0', async () => {
-  const { ledgerDir } = buildAnchoredLedger();
-  const report = await verifyLedger(ledgerDir);
+  const { ledgerDir, rekor } = buildAnchoredLedger();
+  const report = await verifyLedger(ledgerDir, { rekorPubPem: rekor.publicPem });
   assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
   assert.equal(report.result, 'VERIFIED');
-  assert.ok(report.checks.find((c) => c.name === 'ANCHOR')?.ok);
+  const anchor = report.checks.find((c) => c.name === 'ANCHOR')!;
+  assert.ok(anchor.ok);
+  assert.ok(!anchor.warn, 'authenticated against the trusted Rekor key');
+  assert.ok(anchor.lines[0]!.includes('authenticated'));
+});
+
+test('without a trusted Rekor key, anchors are reported UNAUTHENTICATED, not verified', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  // no --rekor-key and no host pin: the key shipped inside the artifact must
+  // NOT be used to authenticate the artifact.
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0);
+  const anchor = report.checks.find((c) => c.name === 'ANCHOR')!;
+  assert.ok(anchor.ok);
+  assert.ok(anchor.warn, 'must warn that anchors are unauthenticated');
+  assert.ok(anchor.lines.some((l) => l.includes('NOT authenticated')));
 });
 
 test('core-field mutation: exit 1, blast radius from tampered entry', async () => {
@@ -178,9 +193,9 @@ test('full rewrite + re-sign with attacker key, anchors kept: ANCHOR catches off
 });
 
 test('forged anchor file (attacker fake Rekor key): SET verification fails', async () => {
-  const { ledgerDir } = buildAnchoredLedger();
-  // attacker regenerates the stored anchor with their own "Rekor" key but
-  // cannot replace the pinned log key (auditor cross-checks it)
+  const { ledgerDir, rekor } = buildAnchoredLedger();
+  // attacker re-signs the stored anchor with their own "Rekor" key AND ships
+  // the matching key inside the artifact — the auditor's trusted key wins.
   const lines = readLines(ledgerDir);
   const anchor = lines.map((l) => JSON.parse(l) as LedgerEntry).find((e) => e.type === 'anchor')!;
   const ckptSeq = (JSON.parse(anchor.payload!) as { checkpoint_seq: number }).checkpoint_seq;
@@ -198,8 +213,10 @@ test('forged anchor file (attacker fake Rekor key): SET verification fails', asy
     fake.privateKey,
   ).toString('base64');
   writeFileSync(join(ledgerDir, 'anchors', `${ckptSeq}.json`), JSON.stringify(stored));
+  // the attacker also swaps the artifact's own copy of the log key to match
+  writeFileSync(join(ledgerDir, 'anchors', 'rekor-pub.pem'), fake.publicPem);
 
-  const report = await verifyLedger(ledgerDir);
+  const report = await verifyLedger(ledgerDir, { rekorPubPem: rekor.publicPem });
   assert.equal(report.exitCode, 1);
   assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && f.reason.includes('SET')));
 });
@@ -229,6 +246,79 @@ test('anchor lag reported for entries after last anchored checkpoint', async () 
   assert.equal(report.exitCode, 0);
   assert.ok(report.anchorLag);
   assert.ok(report.anchorLag!.count >= 1);
+});
+
+test('redaction drops the salt too, so payload_hash cannot be brute-forced', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const entries = readEntries(join(ledgerDir, 'ledger.jsonl'));
+  const target = entries.find((e) => e.payload?.includes('100.00'))!;
+  const { redactEntry } = await import('../src/redact.ts');
+  const redacted = redactEntry(ledgerDir, target.seq);
+  assert.equal(redacted.payload, undefined);
+  assert.equal(redacted.salt, undefined, 'salt must not survive redaction');
+  assert.equal(redacted.payload_hash, target.payload_hash, 'commitment survives');
+  // a guesser who knows the exact plaintext still cannot confirm it
+  const { payloadHash } = await import('../src/ledger.ts');
+  assert.notEqual(payloadHash(undefined, target.payload), target.payload_hash);
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings));
+});
+
+test('stripping a system payload (gap / checkpoint) is tamper, not redaction', async () => {
+  for (const type of ['gap', 'checkpoint'] as const) {
+    const { ledgerDir, keys } = buildAnchoredLedger();
+    if (type === 'gap') {
+      const { Ledger } = await import('../src/ledger.ts');
+      const l = Ledger.open(ledgerDir, keys);
+      l.append({ type: 'gap', origin: 'proxy', payload: JSON.stringify({ unrecorded_lines: 9 }) });
+      l.close();
+    }
+    const lines = readLines(ledgerDir);
+    const idx = lines.findIndex((l) => (JSON.parse(l) as LedgerEntry).type === type);
+    const e = JSON.parse(lines[idx]!) as LedgerEntry;
+    delete e.payload;
+    delete e.salt;
+    lines[idx] = JSON.stringify(e);
+    writeLines(ledgerDir, lines);
+
+    const report = await verifyLedger(ledgerDir);
+    assert.equal(report.exitCode, 1, `${type} payload strip must be tamper`);
+    assert.ok(report.findings.some((f) => f.reason.includes('not redactable')), `${type}: ${JSON.stringify(report.findings)}`);
+  }
+});
+
+test('unknown unsigned top-level field is rejected', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const lines = readLines(ledgerDir);
+  const e = JSON.parse(lines[4]!) as LedgerEntry & { note?: string };
+  e.note = 'attacker-supplied annotation the signature does not cover';
+  lines[4] = JSON.stringify(e);
+  writeLines(ledgerDir, lines);
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1);
+  assert.ok(report.findings.some((f) => f.reason.includes('unknown unsigned field')));
+});
+
+test('anchor signed by a rotated recorder key is accepted (rotate then drain queue)', async () => {
+  const { ledgerDir, keys, rekor } = buildAnchoredLedger();
+  const { Ledger } = await import('../src/ledger.ts');
+  const { generateKey } = await import('../src/keys.ts');
+  const { writeCheckpoint } = await import('../src/checkpoint.ts');
+  const { fakeAnchor } = await import('./helpers.ts');
+  const ledger = Ledger.open(ledgerDir, keys);
+  const newKeys = generateKey(join(ledgerDir, '..', 'home2'));
+  ledger.append({ type: 'key_rotation', origin: 'system', payload: newKeys.publicPem });
+  ledger.close();
+  // subsequent entries + anchor are produced with the NEW key
+  const ledger2 = Ledger.open(ledgerDir, newKeys);
+  ledger2.append({ type: 'wire', origin: 'proxy', payload: '"post-rotation"' });
+  const ckpt = writeCheckpoint(ledger2);
+  fakeAnchor(ledger2, ckpt, rekor);
+  ledger2.close();
+
+  const report = await verifyLedger(ledgerDir, { rekorPubPem: rekor.publicPem });
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings, null, 2));
 });
 
 test('--entry SEQ: inclusion path to nearest covering (anchored) checkpoint', async () => {

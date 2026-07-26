@@ -126,6 +126,31 @@ export async function getEntry(baseUrl: string, uuid: string): Promise<RekorEntr
   return entry;
 }
 
+/**
+ * Discover every Rekor UUID logged under a recorder public key. Best-effort:
+ * the public instance's index endpoint may be disabled, in which case this
+ * throws RekorUnavailableError and the caller degrades gracefully.
+ */
+export async function searchByPublicKey(baseUrl: string, publicPem: string): Promise<string[]> {
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/api/v1/index/retrieve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ publicKey: { format: 'x509', content: Buffer.from(publicPem).toString('base64') } }),
+    });
+  } catch (err) {
+    throw new RekorUnavailableError(`rekor index unreachable: ${(err as Error).message}`);
+  }
+  if (res.status === 404 || res.status === 501) return []; // endpoint disabled — degrade
+  if (!res.ok) {
+    if (res.status === 429 || res.status >= 500) throw new RekorUnavailableError(`rekor index ${res.status}`);
+    return [];
+  }
+  const json = (await res.json().catch(() => [])) as unknown;
+  return Array.isArray(json) ? (json as string[]) : [];
+}
+
 export async function getLogPublicKey(baseUrl: string): Promise<string> {
   let res: Response;
   try {
@@ -330,6 +355,12 @@ function writePendingAll(ledgerDir: string, records: PendingAnchor[]): void {
     pendingPath(ledgerDir),
     records.map((r) => JSON.stringify(r) + '\n').join(''),
   );
+}
+
+/** Queue a checkpoint for anchoring on a later run (public entry point). */
+export function queueAnchorForRetry(ledgerDir: string, checkpointSeq: number): void {
+  if (readPending(ledgerDir).some((r) => r.checkpoint_seq === checkpointSeq)) return;
+  queuePending(ledgerDir, checkpointSeq, 0);
 }
 
 function queuePending(ledgerDir: string, checkpointSeq: number, attempts: number): void {

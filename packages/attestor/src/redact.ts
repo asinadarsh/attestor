@@ -31,7 +31,10 @@ export function redactEntry(ledgerDir: string, seq: number): LedgerEntry {
     throw new Error(`refusing to redact ${entry.type} entry — its payload is required for verification`);
   }
   if (entry.payload === undefined) throw new Error(`entry ${seq} is already redacted`);
+  // Drop BOTH payload and salt: with the salt gone, the surviving signed
+  // payload_hash = SHA256(salt‖bytes) can no longer be brute-forced.
   delete entry.payload;
+  delete entry.salt;
   lines[seq] = JSON.stringify(entry);
   const tmpPath = path + '.redact-tmp';
   writeFileSync(tmpPath, lines.join('\n') + '\n');

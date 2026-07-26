@@ -168,6 +168,84 @@ test('block mode: failed ledger write rejects the call BEFORE dispatch', async (
   assert.equal(stub.calls.length, 0, 'request never dispatched without a record');
 });
 
+test('block mode: a failed streaming record leaves a gap marker, never silence', async () => {
+  const { dir, attestor, ledgerPath } = newAttestor();
+  const sse =
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_x","name":"payments_transfer"}}\n\n' +
+    'data: {"type":"content_block_stop","index":0}\n\n';
+  const sseFetch = (async () =>
+    new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })) as typeof fetch;
+  const wrapped = attestor.wrapFetch(sseFetch);
+
+  // break the ledger only for the async response-record path
+  const internal = (attestor as unknown as { ledger: { append: (...a: unknown[]) => unknown } }).ledger;
+  const realAppend = internal.append.bind(internal);
+  let broken = false;
+  internal.append = (...args: unknown[]) => {
+    if (broken) throw new Error('disk full (injected)');
+    return realAppend(...args);
+  };
+  const res = await wrapped('https://api.anthropic.com/v1/messages', { method: 'POST', body: '{}' });
+  broken = true;
+  await res.text(); // app consumes the stream fine
+  await sleep(120); // async record path fails here
+  broken = false;
+  await attestor.close();
+
+  const entries = readEntries(ledgerPath);
+  assert.ok(
+    entries.some((e) => e.type === 'gap'),
+    'block mode must not swallow the failure — a gap marker records the hole',
+  );
+  const report = await verifyLedger(join(dir, 'ledger'));
+  assert.equal(report.exitCode, 0);
+});
+
+test('block mode refuses request bodies it cannot record byte-exactly', async () => {
+  const { attestor } = newAttestor();
+  const stub = stubFetch(OPENAI_CHAT_BODY);
+  const wrapped = attestor.wrapFetch(stub.fetch);
+  const form = new FormData();
+  form.append('file', 'audio-bytes');
+  await assert.rejects(
+    () => wrapped('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', body: form }),
+    /cannot be recorded byte-exactly/,
+  );
+  assert.equal(stub.calls.length, 0, 'unrecordable call never dispatched in block mode');
+  await attestor.close();
+});
+
+test('continue mode records an explicit note for unrecordable bodies', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const attestor = new Attestor({ ledger: join(dir, 'ledger'), keys, offline: true, failMode: 'continue' });
+  const stub = stubFetch(OPENAI_CHAT_BODY);
+  const wrapped = attestor.wrapFetch(stub.fetch);
+  const form = new FormData();
+  form.append('file', 'audio-bytes');
+  const res = await wrapped('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', body: form });
+  assert.equal(res.status, 200);
+  await attestor.close();
+  const entries = readEntries(join(dir, 'ledger', 'ledger.jsonl'));
+  const req = entries.find((e) => e.type === 'call_request')!;
+  assert.ok(req.payload!.includes('not recordable byte-exactly'));
+  assert.ok(req.payload!.includes('FormData'));
+});
+
+test('close() drains the anchor instead of racing a fixed sleep', async () => {
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  const attestor = new Attestor({ ledger: join(dir, 'ledger'), keys, offline: true });
+  attestor.record({ name: 'x' });
+  await attestor.close();
+  const entries = readEntries(join(dir, 'ledger', 'ledger.jsonl'));
+  const ckpt = entries.filter((e) => e.type === 'checkpoint');
+  assert.ok(ckpt.length >= 1, 'final checkpoint written');
+  // offline: the checkpoint must be queued for a later anchor, not forgotten
+  const { readPending } = await import('../src/rekor.ts');
+  assert.ok(readPending(join(dir, 'ledger')).length >= 1, 'unanchored checkpoint queued');
+});
+
 test('continue mode: call proceeds, gap marker on recovery', async () => {
   const dir = tmp();
   const keys = generateKey(join(dir, 'home'));

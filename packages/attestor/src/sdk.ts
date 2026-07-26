@@ -8,7 +8,7 @@
 import { join } from 'node:path';
 import { attestorHome, generateKey, listKeyIds, loadKey, type KeyPair } from './keys.ts';
 import { Checkpointer, lastCheckpointSize } from './checkpoint.ts';
-import { anchorCheckpoint } from './rekor.ts';
+import { anchorCheckpoint, queueAnchorForRetry } from './rekor.ts';
 import { Ledger, readEntries, uuidv7, type LedgerEntry } from './ledger.ts';
 
 export interface AttestorOptions {
@@ -147,6 +147,8 @@ export class Attestor {
   private readonly sessionId: string;
   private gapCount = 0;
   private gapFrom: string | undefined;
+  /** Async record/anchor work that close() must drain. */
+  private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(opts: AttestorOptions = {}) {
     this.ledgerDir = opts.ledger ?? join(attestorHome(), 'ledgers', 'sdk');
@@ -161,7 +163,10 @@ export class Attestor {
     this.checkpointer = new Checkpointer(this.ledger, {
       initialCoveredSize: lastCheckpointSize(readEntries(join(this.ledgerDir, 'ledger.jsonl'))),
       onCheckpoint: (entry) => {
-        void anchorCheckpoint(this.ledger, entry, { offline: this.offline }).catch(() => {});
+        const p = anchorCheckpoint(this.ledger, entry, { offline: this.offline })
+          .catch((err) => process.stderr.write(`[attestor] anchor failed: ${(err as Error).message}\n`))
+          .finally(() => this.inFlight.delete(p));
+        this.inFlight.add(p);
       },
     });
     this.checkpointer.setSession(this.sessionId);
@@ -210,12 +215,27 @@ export class Attestor {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
       let bodyText: string | undefined;
+      let bodyUnrecordable: string | undefined;
       const rawBody = init?.body;
       if (typeof rawBody === 'string') bodyText = rawBody;
       else if (rawBody instanceof Uint8Array) bodyText = Buffer.from(rawBody).toString('utf8');
-      else if (input instanceof Request && rawBody === undefined) {
+      else if (rawBody instanceof ArrayBuffer) bodyText = Buffer.from(rawBody).toString('utf8');
+      else if (rawBody instanceof URLSearchParams) bodyText = rawBody.toString();
+      else if (typeof Blob !== 'undefined' && rawBody instanceof Blob) {
+        bodyText = await rawBody.text().catch(() => undefined);
+      } else if (rawBody !== undefined && rawBody !== null) {
+        // FormData / ReadableStream: consuming them here would break the send.
+        bodyUnrecordable = rawBody.constructor?.name ?? typeof rawBody;
+      } else if (input instanceof Request) {
         bodyText = await input.clone().text().catch(() => undefined);
         if (bodyText === '') bodyText = undefined;
+      }
+      if (bodyUnrecordable !== undefined && this.failMode === 'block') {
+        // fail closed rather than record a call whose bytes we cannot attest
+        throw new Error(
+          `attestor: request body of type ${bodyUnrecordable} cannot be recorded byte-exactly (failMode="block"). ` +
+            `Serialize it yourself, or construct Attestor with failMode:"continue" to proceed with a documented gap.`,
+        );
       }
       const callId = uuidv7();
       let host = 'unknown';
@@ -230,7 +250,12 @@ export class Attestor {
         origin: 'sdk',
         call_id: callId,
         tool: { server: host, name: `${method} ${safePath(url)}` },
-        ...(bodyText !== undefined && { payload: bodyText }),
+        payload:
+          bodyText ??
+          JSON.stringify({
+            attestor_note: 'request body not recordable byte-exactly',
+            body_type: bodyUnrecordable ?? 'none',
+          }),
       });
 
       const res = await base(input as Parameters<typeof fetch>[0], init);
@@ -259,13 +284,32 @@ export class Attestor {
           return res;
         }
       }
-      void recordClone
+      // Streaming (or continue mode): record asynchronously so the app is never
+      // back-pressured. A failure here must still leave a mark in the chain —
+      // in block mode the recorder cannot reject a response the app already
+      // has, so it degrades to an explicit gap rather than silence.
+      const pending = recordClone
         .text()
         .then(finalize)
-        .catch((err) => process.stderr.write(`[attestor] response record failed: ${(err as Error).message}\n`));
+        .catch((err) => {
+          process.stderr.write(`[attestor] response record failed: ${(err as Error).message}\n`);
+          this.noteUnrecorded();
+        })
+        .finally(() => this.inFlight.delete(pending));
+      this.inFlight.add(pending);
       return res;
     };
     return wrapped as typeof fetch;
+  }
+
+  /**
+   * Mark that something the recorder saw could not be written. The count is
+   * flushed as a signed `gap` entry by the next successful append or by
+   * close() — so a swallowed write failure still leaves a mark in the chain.
+   */
+  private noteUnrecorded(): void {
+    this.gapCount++;
+    if (this.gapFrom === undefined) this.gapFrom = new Date().toISOString();
   }
 
   /** Attest what the app actually did between model round trips. */
@@ -288,12 +332,36 @@ export class Attestor {
 
   /** Flush a final checkpoint, write session_end, release the ledger. */
   async close(): Promise<void> {
+    // drain streaming record work first, so its entries land before session_end
+    await Promise.allSettled([...this.inFlight]);
     this.append({ type: 'session_end', origin: 'sdk' });
     this.checkpointer.checkpointNow();
     this.checkpointer.stop();
-    // give an in-flight anchor a moment; queued anchors survive in pending.jsonl
-    await new Promise((r) => setTimeout(r, 25));
+    // Await the final checkpoint's anchor rather than racing a fixed sleep;
+    // whatever misses the deadline stays queued in anchors/pending.jsonl.
+    const drained = await Promise.race([
+      Promise.allSettled([...this.inFlight]).then(() => true),
+      new Promise<boolean>((r) => setTimeout(() => r(false), 5_000).unref?.()),
+    ]);
+    if (!drained) {
+      for (const seq of this.unanchoredCheckpointSeqs()) queueAnchorForRetry(this.ledgerDir, seq);
+    }
     this.ledger.close();
+  }
+
+  private unanchoredCheckpointSeqs(): number[] {
+    const entries = readEntries(join(this.ledgerDir, 'ledger.jsonl'));
+    const anchored = new Set<number>();
+    for (const e of entries) {
+      if (e.type === 'anchor' && e.payload !== undefined) {
+        try {
+          anchored.add((JSON.parse(e.payload) as { checkpoint_seq: number }).checkpoint_seq);
+        } catch {
+          /* verify reports malformed anchors */
+        }
+      }
+    }
+    return entries.filter((e) => e.type === 'checkpoint' && !anchored.has(e.seq)).map((e) => e.seq);
   }
 }
 

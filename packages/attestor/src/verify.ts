@@ -10,7 +10,9 @@ import {
   coreOf,
   genesisPrev,
   hashCore,
+  KNOWN_ENTRY_KEYS,
   payloadHash,
+  SYSTEM_TYPES,
   verifyCoreSig,
   type LedgerEntry,
 } from './ledger.ts';
@@ -18,7 +20,10 @@ import { computeRootHex, type CheckpointPayload } from './checkpoint.ts';
 import { inclusionProof, leafHash, verifyInclusion } from './merkle.ts';
 import {
   getEntry,
+  getLogPublicKey,
+  rekorUrl,
   RekorUnavailableError,
+  searchByPublicKey,
   verifyCheckpointNote,
   verifyRekorInclusion,
   verifySET,
@@ -37,6 +42,8 @@ export interface TamperFinding {
 export interface CheckLine {
   name: string;
   ok: boolean;
+  /** ok, but with a caveat the auditor must see (e.g. anchors not authenticated). */
+  warn?: boolean;
   skipped?: boolean;
   lines: string[];
 }
@@ -66,14 +73,20 @@ export interface VerifyReport {
 export interface VerifyOptions {
   online?: boolean;
   entry?: number;
+  /** Auditor-trusted Rekor base URL for --online (never the ledger-embedded URL). */
   rekorUrl?: string;
+  /** Auditor-supplied trusted Rekor log public key (PEM), highest precedence. */
+  rekorPubPem?: string;
 }
 
 interface ResolvedLedger {
   entries: LedgerEntry[];
   anchorFile: (checkpointSeq: number) => string | undefined;
   storedAnchorSeqs: number[];
-  rekorPubPem: string | undefined;
+  /** Rekor log key the auditor independently trusts (host-pinned). */
+  trustedRekorPem: string | undefined;
+  /** Rekor log key shipped INSIDE the artifact — NOT trusted to authenticate itself. */
+  artifactRekorPem: string | undefined;
 }
 
 /** Accepts a live ledger dir, an exported evidence pack, or a ledger.jsonl path. */
@@ -122,18 +135,25 @@ function resolveTarget(target: string): ResolvedLedger {
       if (m) storedAnchorSeqs.push(Number(m[1]));
     }
   }
-  let rekorPubPem: string | undefined;
-  for (const p of [
-    join(base, 'anchors', 'rekor-pub.pem'),
-    join(base, 'keys', 'rekor-pub.pem'),
-    join(keysDir(attestorHome()), 'rekor-pub.pem'),
-  ]) {
+  // The auditor's own pinned Rekor key is trusted. The copy shipped inside the
+  // artifact (pack/ledger) is NOT — an attacker who forges anchors can ship a
+  // matching key. Keeping them separate is the whole point.
+  const hostPin = join(keysDir(attestorHome()), 'rekor-pub.pem');
+  const trustedRekorPem = existsSync(hostPin) ? readFileSync(hostPin, 'utf8') : undefined;
+  let artifactRekorPem: string | undefined;
+  for (const p of [join(base, 'anchors', 'rekor-pub.pem'), join(base, 'keys', 'rekor-pub.pem')]) {
     if (existsSync(p)) {
-      rekorPubPem = readFileSync(p, 'utf8');
+      artifactRekorPem = readFileSync(p, 'utf8');
       break;
     }
   }
-  return { entries, anchorFile, storedAnchorSeqs: [...new Set(storedAnchorSeqs)].sort((a, b) => a - b), rekorPubPem };
+  return {
+    entries,
+    anchorFile,
+    storedAnchorSeqs: [...new Set(storedAnchorSeqs)].sort((a, b) => a - b),
+    trustedRekorPem,
+    artifactRekorPem,
+  };
 }
 
 export async function verifyLedger(target: string, opts: VerifyOptions = {}): Promise<VerifyReport> {
@@ -150,7 +170,7 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       auditPacket: { error: (err as Error).message },
     };
   }
-  const { entries, anchorFile, storedAnchorSeqs, rekorPubPem } = resolved;
+  const { entries, anchorFile, storedAnchorSeqs } = resolved;
   const findings: TamperFinding[] = [];
   const checks: CheckLine[] = [];
   const n = entries.length;
@@ -218,6 +238,16 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
         got: e.hash,
       });
     }
+    // no unsigned top-level key may ride along unhashed
+    for (const k of Object.keys(e)) {
+      if (!KNOWN_ENTRY_KEYS.has(k)) {
+        findings.push({
+          seq: i,
+          check: 'CHAIN',
+          reason: `entry ${i} carries unknown unsigned field "${k}" (not covered by the signature)`,
+        });
+      }
+    }
     if (e.payload !== undefined) {
       if (payloadHash(e.salt, e.payload) !== e.payload_hash) {
         findings.push({
@@ -228,7 +258,15 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
           got: payloadHash(e.salt, e.payload),
         });
       }
-    } else if (!['session_end', 'session_start', 'gap'].includes(e.type)) {
+    } else if (SYSTEM_TYPES.has(e.type)) {
+      // genesis/checkpoint/anchor/key_rotation/gap payloads are load-bearing —
+      // a missing one is tamper, not a legitimate redaction.
+      findings.push({
+        seq: i,
+        check: 'CHAIN',
+        reason: `entry ${i} is a ${e.type} entry with its payload stripped (system payloads are not redactable)`,
+      });
+    } else if (e.type !== 'session_end') {
       redactedCount++;
     }
     prev = h;
@@ -301,8 +339,10 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
   let activePub: KeyObject | undefined;
   let activePem = genesisPubPem;
   const pemAtSeq: string[] = [];
+  const validKeyIds = new Set<string>(); // every recorder key in the rotation chain
   try {
     activePub = genesisPubPem !== undefined ? createPublicKey(genesisPubPem) : undefined;
+    if (activePub) validKeyIds.add(keyIdOf(activePub));
   } catch {
     findings.push({ seq: 0, check: 'SIG', reason: 'genesis public key unparsable' });
     sigFailures++;
@@ -329,6 +369,7 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       try {
         activePub = createPublicKey(e.payload);
         activePem = e.payload;
+        validKeyIds.add(keyIdOf(activePub));
       } catch {
         findings.push({ seq: i, check: 'SIG', reason: `key_rotation ${i} carries unparsable public key` });
         sigFailures++;
@@ -345,10 +386,15 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
   });
 
   // ---- ANCHOR (offline) -------------------------------------------------
+  // SET/inclusion/note authenticity requires a TRUSTED Rekor log key (auditor-
+  // supplied or host-pinned). The key shipped inside the artifact cannot
+  // authenticate the artifact, so it is never used for that.
+  const trustedRekorPem = opts.rekorPubPem ?? resolved.trustedRekorPem;
   const anchorEntries = entries.filter((e) => e.type === 'anchor');
   const anchors: { payload: AnchorPayload; stored: RekorEntry & { uuid?: string } }[] = [];
   let anchorFailures = 0;
   let setChecked = 0;
+  let unauthenticated = 0; // anchors whose digest matched but SET was not trust-verified
   for (const a of anchorEntries) {
     if (a.payload === undefined) {
       findings.push({ seq: a.seq, check: 'ANCHOR', reason: `anchor ${a.seq} payload missing` });
@@ -407,17 +453,19 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       anchorFailures++;
       continue;
     }
+    // The Rekor artifact must have been signed by one of the ledger's own
+    // recorder keys (any key in the rotation chain — an anchor may be written
+    // by a rotated key when a queued checkpoint drains after rotation).
     const anchoredPubPem = decoded.spec?.signature?.publicKey?.content
       ? Buffer.from(decoded.spec.signature.publicKey.content, 'base64').toString('utf8')
       : undefined;
-    const expectedPem = pemAtSeq[payload.checkpoint_seq];
-    if (anchoredPubPem !== undefined && expectedPem !== undefined) {
+    if (anchoredPubPem !== undefined && validKeyIds.size > 0) {
       try {
-        if (keyIdOf(createPublicKey(anchoredPubPem)) !== keyIdOf(createPublicKey(expectedPem))) {
+        if (!validKeyIds.has(keyIdOf(createPublicKey(anchoredPubPem)))) {
           findings.push({
             seq: a.seq,
             check: 'ANCHOR',
-            reason: `anchor ${a.seq} was signed by a key other than the ledger's recorder key`,
+            reason: `anchor ${a.seq} was signed by a key that is not in this ledger's recorder-key rotation chain`,
           });
           anchorFailures++;
           continue;
@@ -426,27 +474,38 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
         /* unparsable pem already reported elsewhere */
       }
     }
-    if (rekorPubPem !== undefined) {
-      setChecked++;
-      if (!verifySET(stored, rekorPubPem)) {
+    // Authenticate the Rekor entry itself — only meaningful with a trusted key.
+    if (trustedRekorPem !== undefined) {
+      if (!verifySET(stored, trustedRekorPem)) {
         findings.push({
           seq: a.seq,
           check: 'ANCHOR',
-          reason: `anchor ${a.seq}: Rekor SET signature invalid (stored anchor forged?)`,
+          reason: `anchor ${a.seq}: Rekor SET signature invalid under the trusted log key (stored anchor forged?)`,
         });
         anchorFailures++;
         continue;
       }
       const proof = stored.verification?.inclusionProof;
-      if (proof && !verifyRekorInclusion(stored)) {
+      if (!proof) {
+        findings.push({ seq: a.seq, check: 'ANCHOR', reason: `anchor ${a.seq}: no inclusion proof present (stripped?)` });
+        anchorFailures++;
+        continue;
+      }
+      if (!verifyRekorInclusion(stored)) {
         findings.push({ seq: a.seq, check: 'ANCHOR', reason: `anchor ${a.seq}: stored inclusion proof invalid` });
         anchorFailures++;
         continue;
       }
-      if (proof && !verifyCheckpointNote(proof, rekorPubPem)) {
+      if (!verifyCheckpointNote(proof, trustedRekorPem)) {
         findings.push({ seq: a.seq, check: 'ANCHOR', reason: `anchor ${a.seq}: Rekor checkpoint note signature invalid` });
         anchorFailures++;
+        continue;
       }
+      setChecked++;
+    } else {
+      // digest matched our recomputed checkpoint, but we cannot prove the
+      // anchor is genuinely in the public log without a trusted key.
+      unauthenticated++;
     }
   }
   // Orphaned stored anchors: a Rekor entry exists on disk for a checkpoint
@@ -463,17 +522,24 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
     }
   }
   const anchorOk = anchorFailures === 0;
+  const anchorWarn = anchorOk && unauthenticated > 0;
   const anchorSummary =
     anchorEntries.length === 0
       ? ['no anchors recorded — ledger is chain-protected only, not externally anchored']
       : [
-          `${anchorEntries.length - anchorFailures}/${anchorEntries.length} anchored in Rekor` +
+          `${anchorEntries.length - anchorFailures}/${anchorEntries.length} anchor${anchorEntries.length === 1 ? '' : 's'} recorded` +
             (anchors.length > 0 ? ` (latest logIndex ${anchors[anchors.length - 1]!.payload.logIndex})` : '') +
-            (rekorPubPem === undefined ? ' — SET not verified (no pinned Rekor key)' : `, SET+inclusion verified for ${setChecked}`),
+            (setChecked > 0 ? `, SET+inclusion authenticated for ${setChecked} against the trusted Rekor key` : ''),
+          ...(unauthenticated > 0
+            ? [
+                `${unauthenticated} anchor${unauthenticated === 1 ? '' : 's'} matched the local checkpoint digest but are NOT authenticated — no trusted Rekor key available. Run with --online (or pin the log key) to confirm against the public log.`,
+              ]
+            : []),
         ];
   checks.push({
     name: 'ANCHOR',
     ok: anchorOk,
+    warn: anchorWarn,
     lines: anchorOk ? anchorSummary : findingLines(findings, 'ANCHOR'),
   });
 
@@ -492,16 +558,25 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
   if (opts.online) {
     let onlineFailures = 0;
     let checked = 0;
-    for (const { payload, stored } of anchors) {
-      try {
-        const fresh = await getEntry(opts.rekorUrl ?? payload.url, payload.uuid);
+    let discovered = 0;
+    // Trust anchor for --online: the auditor's URL (flag/env/default) — NEVER
+    // the URL embedded in the ledger, which an attacker controls.
+    const trustedUrl = opts.rekorUrl ?? rekorUrl();
+    let liveLogKey: string | undefined;
+    try {
+      liveLogKey = await getLogPublicKey(trustedUrl);
+      for (const { payload, stored } of anchors) {
+        const fresh = await getEntry(trustedUrl, payload.uuid);
         checked++;
-        if (fresh.body !== stored.body) {
-          findings.push({
-            seq: payload.checkpoint_seq,
-            check: 'ANCHOR-ONLINE',
-            reason: `Rekor logIndex ${payload.logIndex}: public log body differs from stored anchor`,
-          });
+        // authenticate the fresh entry against the LIVE log key, then compare
+        // its committed digest to our recomputed checkpoint.
+        if (!verifySET(fresh, liveLogKey)) {
+          findings.push({ seq: payload.checkpoint_seq, check: 'ANCHOR-ONLINE', reason: `logIndex ${payload.logIndex}: fresh Rekor SET invalid under the live log key` });
+          onlineFailures++;
+          continue;
+        }
+        if (fresh.verification?.inclusionProof && !verifyRekorInclusion(fresh)) {
+          findings.push({ seq: payload.checkpoint_seq, check: 'ANCHOR-ONLINE', reason: `fresh inclusion proof invalid for logIndex ${payload.logIndex}` });
           onlineFailures++;
           continue;
         }
@@ -512,28 +587,49 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
           findings.push({
             seq: payload.checkpoint_seq,
             check: 'ANCHOR-ONLINE',
-            reason: `local checkpoint ${payload.checkpoint_seq} does not match the public log (full-rewrite detected)`,
+            reason: `local checkpoint ${payload.checkpoint_seq} does not match the public log (full-rewrite or forged anchor detected)`,
             expected: freshBodyHash,
             got: recomputed[payload.checkpoint_seq],
           });
           onlineFailures++;
-          continue;
         }
-        if (!verifyRekorInclusion(fresh)) {
-          findings.push({
-            seq: payload.checkpoint_seq,
-            check: 'ANCHOR-ONLINE',
-            reason: `fresh inclusion proof invalid for logIndex ${payload.logIndex}`,
-          });
-          onlineFailures++;
-        }
-      } catch (err) {
-        if (err instanceof RekorUnavailableError) {
-          rekorUnreachable = true;
-          break;
-        }
-        throw err;
       }
+      // Discover-by-pubkey: anchors that exist in the PUBLIC log under our
+      // recorder key(s) but that our local ledger does not account for →
+      // evidence that history was longer (deleted anchors / rollback).
+      const heldUuids = new Set(anchors.map((a) => a.payload.uuid));
+      const localRoots = new Set([...checkpointPayloads.values()].map((p) => p.root));
+      for (const pem of new Set(pemAtSeq)) {
+        let uuids: string[] = [];
+        try {
+          uuids = await searchByPublicKey(trustedUrl, pem);
+        } catch (err) {
+          if (err instanceof RekorUnavailableError) continue; // index disabled — best effort
+          throw err;
+        }
+        for (const uuid of uuids) {
+          if (heldUuids.has(uuid)) continue;
+          const extra = await getEntry(trustedUrl, uuid).catch(() => undefined);
+          if (!extra || !verifySET(extra, liveLogKey)) continue;
+          discovered++;
+          const digest = (JSON.parse(Buffer.from(extra.body, 'base64').toString('utf8')) as {
+            spec?: { data?: { hash?: { value?: string } } };
+          }).spec?.data?.hash?.value;
+          // If the public log holds an anchor whose committed checkpoint root
+          // our ledger cannot reproduce, history was altered or truncated.
+          if (digest !== undefined && !recomputed.includes(digest) && !localRoots.has(digest)) {
+            findings.push({
+              seq: n - 1,
+              check: 'ANCHOR-ONLINE',
+              reason: `public Rekor log holds an anchor (logIndex ${extra.logIndex}) under this recorder key that the local ledger does not account for — history was truncated or rewritten`,
+            });
+            onlineFailures++;
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof RekorUnavailableError) rekorUnreachable = true;
+      else throw err;
     }
     checks.push({
       name: 'ANCHOR-ONLINE',
@@ -542,7 +638,7 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       lines: rekorUnreachable
         ? ['Rekor unreachable — cannot compare against the public log']
         : onlineFailures === 0
-          ? [`${checked}/${anchors.length} anchors match the public log (fresh proofs verified)`]
+          ? [`${checked}/${anchors.length} anchor${anchors.length === 1 ? '' : 's'} authenticated against the live log` + (discovered > 0 ? `; ${discovered} extra log entr${discovered === 1 ? 'y' : 'ies'} discovered and reconciled` : '')]
           : findingLines(findings, 'ANCHOR-ONLINE'),
     });
   }
@@ -651,6 +747,7 @@ function truncate(s: string): string {
 
 const GREEN = '\x1b[32m';
 const RED = '\x1b[31m';
+const YELLOW = '\x1b[33m';
 const DIM = '\x1b[2m';
 const BOLD = '\x1b[1m';
 const RESET = '\x1b[0m';
@@ -659,11 +756,17 @@ export function renderReport(report: VerifyReport, useColor = process.stdout.isT
   const c = (code: string, s: string) => (useColor ? `${code}${s}${RESET}` : s);
   const out: string[] = [];
   for (const check of report.checks) {
-    const mark = check.skipped ? c(DIM, '∅') : check.ok ? c(GREEN, '✔') : c(RED, '✖');
+    const mark = check.skipped
+      ? c(DIM, '∅')
+      : !check.ok
+        ? c(RED, '✖')
+        : check.warn
+          ? c(YELLOW, '⚠')
+          : c(GREEN, '✔');
     const first = check.lines[0] ?? '';
     out.push(`${mark} ${check.name.padEnd(8)} ${check.ok || check.skipped ? first : c(RED, first)}`);
     for (const extra of check.lines.slice(1)) {
-      out.push(`           ${c(DIM, extra)}`);
+      out.push(`           ${c(check.warn ? YELLOW : DIM, extra)}`);
     }
   }
   if (report.blastRadius) {

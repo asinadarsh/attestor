@@ -36,10 +36,18 @@ interface PendingCall {
   startedAt: number;
 }
 
+export interface LineSplitter {
+  (chunk: Buffer): void;
+  /** Bytes received after the last newline (never framed). */
+  partial(): Buffer;
+  /** Take and clear the unterminated tail. */
+  takePartial(): Buffer;
+}
+
 /** Split a byte stream into newline-framed lines, preserving exact bytes. */
-export function lineSplitter(onLine: (line: Buffer) => void): (chunk: Buffer) => void {
+export function lineSplitter(onLine: (line: Buffer) => void): LineSplitter {
   let rest: Buffer = Buffer.alloc(0);
-  return (chunk: Buffer) => {
+  const feed = ((chunk: Buffer) => {
     let data = rest.length > 0 ? Buffer.concat([rest, chunk]) : chunk;
     for (;;) {
       const nl = data.indexOf(10);
@@ -48,7 +56,14 @@ export function lineSplitter(onLine: (line: Buffer) => void): (chunk: Buffer) =>
       data = data.subarray(nl + 1);
     }
     rest = data;
+  }) as LineSplitter;
+  feed.partial = () => rest;
+  feed.takePartial = () => {
+    const p = rest;
+    rest = Buffer.alloc(0);
+    return p;
   };
+  return feed;
 }
 
 interface ParsedMeta {
@@ -160,13 +175,23 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
   return new Promise<number>((resolve) => {
     let settled = false;
     let finalized = false;
+    // assigned once the splitters exist; finalize() may run before that
+    let flushPartials = (): void => {};
     // Synchronous final writes — safe to run from a signal handler, because
     // ledger appends are sync (writeSync + fsync).
     const finalize = () => {
       if (finalized) return;
       finalized = true;
+      // Flush any bytes not terminated by a newline — the peer transmitted
+      // them, so they belong in the record even though they never framed.
+      flushPartials();
       record({ type: 'session_end', origin: 'proxy' });
-      checkpointer.checkpointNow();
+      try {
+        checkpointer.checkpointNow();
+      } catch (err) {
+        // a broken ledger must not throw out of a signal handler
+        diag(`final checkpoint failed: ${(err as Error).message}`);
+      }
       checkpointer.stop();
     };
     const finish = (code: number) => {
@@ -192,6 +217,22 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
       diag(`failed to spawn ${opts.command}: ${err.message}`);
       finish(127);
     });
+    // A child that has exited makes writes raise EPIPE/ERR_STREAM_DESTROYED as
+    // an 'error' event; without a handler that crashes the proxy.
+    child.stdin.on('error', (err) => diag(`child stdin error: ${err.message}`));
+
+    /** Forward to the child, surviving a dead pipe. */
+    const writeToChild = (buf: Buffer): void => {
+      if (child.stdin.destroyed || child.stdin.writableEnded) {
+        diag('child stdin closed — request could not be delivered');
+        return;
+      }
+      try {
+        child.stdin.write(buf);
+      } catch (err) {
+        diag(`child stdin write failed: ${(err as Error).message}`);
+      }
+    };
 
     // ---- client → server ----
     const c2s = lineSplitter((line) => {
@@ -222,10 +263,13 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
               error: { code: -32000, message: 'attestor: audit ledger unavailable — call blocked (on-error=block)' },
             }) + '\n',
           );
-        } else {
-          diag(`dropped unrecordable ${meta.kind} (on-error=block)`);
+          return;
         }
-        return;
+        // Responses to server-initiated requests (sampling/elicitation) and
+        // protocol notifications must still flow: dropping them wedges the
+        // session forever with no error anyone can see. Forward, and let the
+        // gap marker record that these bytes went unrecorded.
+        diag(`relaying unrecordable ${meta.kind} (blocking it would wedge the session; covered by gap marker)`);
       }
       if (meta.kind === 'request') {
         pendingCalls.set(meta.id!, {
@@ -233,7 +277,7 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
           startedAt: Date.now(),
         });
       }
-      child.stdin.write(Buffer.concat([line, Buffer.from('\n')]));
+      writeToChild(Buffer.concat([line, Buffer.from('\n')]));
     });
 
     // ---- server → client ----
@@ -254,11 +298,36 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
       stdout.write(Buffer.concat([line, Buffer.from('\n')]));
     });
 
+    // Record any bytes the peers sent that never got a terminating newline —
+    // a crashed server's partial write is evidence, not something to discard.
+    flushPartials = () => {
+      for (const [splitter, direction] of [
+        [c2s, 'c2s'],
+        [s2c, 's2c'],
+      ] as const) {
+        const partial = splitter.takePartial();
+        if (partial.length === 0) continue;
+        record({
+          type: 'wire',
+          origin: 'proxy',
+          direction,
+          payload: partial.toString('utf8'),
+        });
+        diag(`recorded ${partial.length} unterminated ${direction} byte(s) at shutdown`);
+      }
+    };
+
     stdin.on('data', c2s);
     stdin.on('end', () => {
-      child.stdin.end();
+      try {
+        child.stdin.end();
+      } catch {
+        /* child already gone */
+      }
     });
+    stdin.on('error', (err) => diag(`stdin error: ${err.message}`));
     child.stdout.on('data', s2c);
+    child.stdout.on('error', (err) => diag(`child stdout error: ${err.message}`));
     child.on('close', (code, signal) => {
       finish(code ?? (signal ? 128 + 15 : 0));
     });
