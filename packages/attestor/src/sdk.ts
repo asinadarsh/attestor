@@ -233,7 +233,7 @@ export class Attestor {
         ...(bodyText !== undefined && { payload: bodyText }),
       });
 
-      const res = await base(input as RequestInfo, init);
+      const res = await base(input as Parameters<typeof fetch>[0], init);
 
       // record from a clone at our own pace; the app's stream is untouched
       const recordClone = res.clone();

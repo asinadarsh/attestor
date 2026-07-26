@@ -38,7 +38,7 @@ interface PendingCall {
 
 /** Split a byte stream into newline-framed lines, preserving exact bytes. */
 export function lineSplitter(onLine: (line: Buffer) => void): (chunk: Buffer) => void {
-  let rest = Buffer.alloc(0);
+  let rest: Buffer = Buffer.alloc(0);
   return (chunk: Buffer) => {
     let data = rest.length > 0 ? Buffer.concat([rest, chunk]) : chunk;
     for (;;) {
