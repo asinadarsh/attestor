@@ -195,6 +195,19 @@ Env: `ATTESTOR_HOME` (default `~/.attestor`), `ATTESTOR_REKOR_URL`,
 `ATTESTOR_OFFLINE=1` (queue anchors, never POST), `ATTESTOR_LIVE=1`
 (opt-in live-network tests).
 
+## Verify my claims, not my prose
+
+`examples/` holds two real evidence packs from one recorded session — one
+clean, one with a single byte changed. Both reference the same anchor in
+Sigstore's public log, so you can check them against a log I do not control:
+
+```sh
+node packages/attestor/src/cli.ts verify examples/pack-2026-07           # exit 0
+node packages/attestor/src/cli.ts verify examples/pack-2026-07-TAMPERED  # exit 1
+```
+
+See [`examples/README.md`](examples/README.md) for the curl recipe.
+
 ## Development
 
 npm-workspaces monorepo: `packages/attestor` (published) +
