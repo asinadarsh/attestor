@@ -1,5 +1,7 @@
 # Attestor
 
+[![CI](https://github.com/asinadarsh/attestor/actions/workflows/ci.yml/badge.svg)](https://github.com/asinadarsh/attestor/actions/workflows/ci.yml)
+
 **A tamper-evident flight recorder for AI agents.**
 
 Your agents are calling tools that move money and touch PHI; when a regulator
