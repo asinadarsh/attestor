@@ -61,7 +61,9 @@ test('Windows: a .cmd shim is launched through cmd.exe with verbatim args', () =
   assert.equal(plan.args[2], '/c');
   assert.match(plan.args[3]!, /^".*"$/, 'whole command line is wrapped in quotes');
   assert.ok(plan.args[3]!.includes('npx'));
-  assert.ok(plan.resolved?.endsWith('npx.cmd'));
+  // On case-insensitive filesystems (Windows, default macOS) the probe may
+  // match npx.cmd via the uppercase PATHEXT entry, so compare case-insensitively.
+  assert.ok(plan.resolved?.toLowerCase().endsWith('npx.cmd'), `resolved: ${plan.resolved}`);
 });
 
 test('Windows: a real .exe is spawned directly, no shell involved', () => {
