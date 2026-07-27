@@ -4,7 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { join, dirname } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join, dirname, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -237,13 +238,14 @@ test('classifyLine: request/response/notification/unparsed', () => {
 
 test('install gives each server its own ledger so concurrent servers do not deadlock', async () => {
   const { wrapConfig } = await import('../src/cli.ts');
+  const inv = { command: 'attestor', prefixArgs: [] as string[] };
   const config = {
     mcpServers: {
       github: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-github'] },
       'My Files!': { command: 'node', args: ['files.js'] },
     },
   };
-  const { changed } = wrapConfig(config);
+  const { changed } = wrapConfig(config, inv);
   assert.deepEqual(changed, ['github', 'My Files!']);
   const names = Object.values(config.mcpServers).map((d) => {
     const i = d.args!.indexOf('--ledger-name');
@@ -253,10 +255,10 @@ test('install gives each server its own ledger so concurrent servers do not dead
   assert.equal(new Set(names).size, names.length, 'ledger dirs must be distinct');
 
   // idempotent across spellings
-  const again = wrapConfig(config);
+  const again = wrapConfig(config, inv);
   assert.deepEqual(again.changed, []);
   const npxStyle = { mcpServers: { a: { command: 'npx', args: ['attestor', 'wrap', '--', 'node', 's.js'] } } };
-  assert.deepEqual(wrapConfig(npxStyle).changed, [], 'npx attestor wrap already counts as wrapped');
+  assert.deepEqual(wrapConfig(npxStyle, inv).changed, [], 'npx attestor wrap already counts as wrapped');
 });
 
 test('unterminated final line is relayed AND recorded, not dropped', async () => {
@@ -323,4 +325,36 @@ test('gap survives a process that never recovers: pending note folded in on next
   assert.ok(entries.some((e) => e.type === 'gap'), 'unrecovered gap must not vanish silently');
   const report = await verifyLedger(ledgerDir);
   assert.equal(report.exitCode, 0, JSON.stringify(report.findings));
+});
+
+test('install writes a command that actually resolves when attestor is not on PATH', async () => {
+  const { wrapConfig, attestorInvocation } = await import('../src/cli.ts');
+  const config = { mcpServers: { toy: { command: 'node', args: ['server.js'] } } };
+  wrapConfig(config, attestorInvocation());
+  const def = config.mcpServers.toy;
+
+  // whatever we wrote must be launchable as-is: either `attestor` on PATH, or
+  // an absolute interpreter + script path.
+  if (def.command !== 'attestor') {
+    assert.ok(isAbsolute(def.command), `command must be absolute, got ${def.command}`);
+    assert.ok(existsSync(def.command), `command must exist: ${def.command}`);
+    const script = def.args![0]!;
+    assert.ok(isAbsolute(script) && existsSync(script), `cli path must exist: ${script}`);
+    assert.equal(def.args![1], 'wrap');
+  }
+  // and re-running install must not double-wrap it
+  assert.deepEqual(wrapConfig(config, attestorInvocation()).changed, []);
+});
+
+test('Claude Desktop config path is correct for each platform', async () => {
+  const { claudeDesktopConfigPaths } = await import('../src/cli.ts');
+  const paths = claudeDesktopConfigPaths();
+  assert.ok(paths.length > 0);
+  for (const p of paths) assert.ok(isAbsolute(p), `${p} must be absolute`);
+  assert.ok(paths.every((p) => p.endsWith('claude_desktop_config.json')));
+  // the current platform's path must not be some other platform's convention
+  const p0 = paths[0]!;
+  if (process.platform === 'win32') assert.ok(/AppData|APPDATA/i.test(p0) || /Claude/.test(p0));
+  else if (process.platform === 'darwin') assert.ok(p0.includes('Library/Application Support'));
+  else assert.ok(p0.includes('.config') || p0.includes('Claude'));
 });

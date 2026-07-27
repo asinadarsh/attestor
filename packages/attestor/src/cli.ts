@@ -3,7 +3,8 @@
 import { parseArgs } from 'node:util';
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
-import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { delimiter, join, resolve } from 'node:path';
 import { attestorHome, generateKey, listKeyIds, loadKey } from './keys.ts';
 import { Ledger, readEntries, uuidv7, type LedgerEntry } from './ledger.ts';
 import { Checkpointer, lastCheckpointSize } from './checkpoint.ts';
@@ -179,8 +180,25 @@ function isAlreadyWrapped(def: McpServerDef): boolean {
   const base = cmd.slice(cmd.lastIndexOf('/') + 1).toLowerCase();
   if (base === 'attestor' || base === 'attestor.cmd' || base === 'attestor.exe') return true;
   const args = def.args ?? [];
-  // `npx attestor wrap …`, `node …/cli.js wrap …`
+  // `npx attestor wrap …`, `<node> …/attestor/dist/cli.js wrap …`
   return args.some((a, i) => a === 'wrap' && args.slice(0, i).some((p) => /attestor/i.test(p)));
+}
+
+/** Claude Desktop's config location, per platform. */
+export function claudeDesktopConfigPaths(): string[] {
+  const file = 'claude_desktop_config.json';
+  switch (platform()) {
+    case 'darwin':
+      return [join(homedir(), 'Library', 'Application Support', 'Claude', file)];
+    case 'win32': {
+      const appData = process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming');
+      return [join(appData, 'Claude', file)];
+    }
+    default: {
+      const xdg = process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config');
+      return [join(xdg, 'Claude', file)];
+    }
+  }
 }
 
 /** Slugify a server name into a filesystem-safe ledger directory name. */
@@ -189,7 +207,37 @@ function ledgerSlug(name: string): string {
   return slug === '' ? 'server' : slug;
 }
 
-export function wrapConfig(config: { mcpServers?: Record<string, McpServerDef> }): {
+/**
+ * How the MCP client should invoke attestor. A bare `attestor` only works if
+ * the package is globally installed; from a git clone it is not on PATH, and
+ * writing it anyway produces a config that silently kills the wrapped server.
+ * So: use `attestor` only when it really resolves, else this exact Node
+ * binary plus the absolute path to this CLI.
+ */
+export function attestorInvocation(): { command: string; prefixArgs: string[] } {
+  if (whichAttestor() !== undefined) return { command: 'attestor', prefixArgs: [] };
+  const cli = fileURLToPath(import.meta.url);
+  return { command: process.execPath, prefixArgs: [cli] };
+}
+
+/** Resolve `attestor` on PATH, honoring PATHEXT on Windows. */
+function whichAttestor(): string | undefined {
+  const exts = platform() === 'win32'
+    ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+    : [''];
+  for (const dir of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    for (const ext of exts) {
+      const candidate = join(dir, `attestor${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+export function wrapConfig(
+  config: { mcpServers?: Record<string, McpServerDef> },
+  invocation: { command: string; prefixArgs: string[] } = attestorInvocation(),
+): {
   changed: string[];
   skipped: string[];
 } {
@@ -203,8 +251,16 @@ export function wrapConfig(config: { mcpServers?: Record<string, McpServerDef> }
     // Each server gets its OWN ledger: the single-writer lockfile means a
     // shared default dir would let the first server start and every other one
     // die with "ledger locked by pid N".
-    def.args = ['wrap', '--ledger-name', ledgerSlug(name), '--', def.command, ...(def.args ?? [])];
-    def.command = 'attestor';
+    def.args = [
+      ...invocation.prefixArgs,
+      'wrap',
+      '--ledger-name',
+      ledgerSlug(name),
+      '--',
+      def.command,
+      ...(def.args ?? []),
+    ];
+    def.command = invocation.command;
     changed.push(name);
   }
   return { changed, skipped };
@@ -220,12 +276,7 @@ async function cmdInstall(argv: string[]): Promise<void> {
   });
   let configPath = values.config;
   if (configPath === undefined) {
-    const candidates = [
-      resolve('.mcp.json'),
-      platform() === 'darwin'
-        ? join(homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
-        : join(homedir(), '.config', 'Claude', 'claude_desktop_config.json'),
-    ];
+    const candidates = [resolve('.mcp.json'), ...claudeDesktopConfigPaths()];
     configPath = candidates.find((p) => existsSync(p));
     if (configPath === undefined) fail('no .mcp.json or Claude Desktop config found — pass --config <file>');
   }
