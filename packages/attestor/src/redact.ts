@@ -23,7 +23,15 @@ export function redactEntry(ledgerDir: string, seq: number): LedgerEntry {
       if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
     }
   }
-  const lines = readFileSync(path, 'utf8').trimEnd().split('\n');
+  const raw = readFileSync(path, 'utf8');
+  // A crash can leave an unterminated final line. `verify` ignores it and the
+  // recorder folds it into ledger.torn on next open — but rewriting the file
+  // here would newline-terminate it, converting benign crash damage into a
+  // permanent "not valid JSON" tamper finding. Drop it, same rule as
+  // Ledger.recoverTornTail.
+  const hadTornTail = raw !== '' && !raw.endsWith('\n');
+  const lines = raw.trimEnd().split('\n');
+  if (hadTornTail) lines.pop();
   if (seq < 0 || seq >= lines.length) throw new Error(`seq ${seq} out of range [0, ${lines.length})`);
   const entry = JSON.parse(lines[seq]!) as LedgerEntry;
   if (entry.seq !== seq) throw new Error(`ledger line ${seq} has seq ${entry.seq} — verify the ledger first`);

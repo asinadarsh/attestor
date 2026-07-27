@@ -23,6 +23,8 @@ Usage:
   attestor wrap [opts] -- <server command...>    record an MCP stdio server
   attestor install [--config <file>] [--dry-run] wrap every server in .mcp.json / Claude Desktop config
   attestor verify <dir> [--online] [--entry N] [--json]
+                        [--rekor-pubkey <f>] [--rekor-url <u>]   authenticate anchors with a key you trust
+                        [--expect-key <keyid|pem>]                require a known recorder identity
   attestor export <ledger-dir> [--out <dir>]     write a regulator-ready evidence pack
   attestor redact <ledger-dir> <seq>             strip a payload (chain & sigs stay valid)
   attestor replay <ledger-dir> [--session <id>]  print recorded tool calls
@@ -159,7 +161,13 @@ async function cmdWrap(argv: string[]): Promise<void> {
     },
   });
   if (!offline) {
-    track(retryPending(ledger).catch(() => {}));
+    // drain anchors queued while Rekor was unreachable; without this they sit
+    // in pending.jsonl forever and the ledger stays silently unanchored
+    track(
+      retryPending(ledger).catch((err) =>
+        process.stderr.write(`[attestor] anchor retry failed: ${(err as Error).message}\n`),
+      ),
+    );
   }
   const code = await runProxy({ ledger, checkpointer, command, args, onError, handleSignals: true });
   // Drain in-flight anchors before closing the ledger (each Rekor request is
@@ -209,12 +217,24 @@ async function cmdVerify(argv: string[]): Promise<void> {
       online: { type: 'boolean', default: false },
       entry: { type: 'string' },
       json: { type: 'boolean', default: false },
+      'rekor-pubkey': { type: 'string' },
+      'rekor-url': { type: 'string' },
+      'expect-key': { type: 'string' },
     },
   });
   const target = positionals[0] ?? defaultLedgerDir();
+  const trustedPem =
+    values['rekor-pubkey'] !== undefined ? readFileSync(values['rekor-pubkey'], 'utf8') : undefined;
   const report = await verifyLedger(target, {
     online: values.online,
     ...(values.entry !== undefined && { entry: Number(values.entry) }),
+    ...(trustedPem !== undefined && { rekorPubPem: trustedPem }),
+    ...(values['rekor-url'] !== undefined && { rekorUrl: values['rekor-url'] }),
+    ...(values['expect-key'] !== undefined && {
+      expectKeyId: existsSync(values['expect-key'])
+        ? readFileSync(values['expect-key'], 'utf8')
+        : values['expect-key'],
+    }),
   });
   if (values.json) {
     process.stdout.write(JSON.stringify(report, null, 2) + '\n');

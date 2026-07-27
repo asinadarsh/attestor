@@ -150,6 +150,17 @@ export function verifyCoreSig(core: SignedCore, sigB64: string, publicKey: KeyOb
   }
 }
 
+/**
+ * The salt is exactly 16 bytes, always. Enforcing that at verification time is
+ * load-bearing, not cosmetic: `payload_hash` is SHA256(salt‖payload) with no
+ * length prefix, and the salt is unsigned (redaction has to be able to drop
+ * it). Without a fixed length an attacker could slide the boundary — move the
+ * payload bytes into the salt and blank the payload — and the commitment would
+ * still match, silently erasing recorded content. A fixed-width salt pins the
+ * split point and closes that.
+ */
+export const SALT_HEX = /^[0-9a-f]{32}$/;
+
 export function payloadHash(saltHex: string | undefined, payload: string | undefined): string {
   const h = createHash('sha256');
   if (saltHex !== undefined) h.update(Buffer.from(saltHex, 'hex'));

@@ -3,12 +3,13 @@
 // checks against a simulated Rekor (fake log key pinned at anchors/).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { generateKeyPairSync, sign as cryptoSign, createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
 import { verifyLedger } from '../src/verify.ts';
 import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHash, type LedgerEntry } from '../src/ledger.ts';
+import { buildPack } from '../src/export.ts';
 import { keyIdOf } from '../src/keys.ts';
 import { hashedRekordBody } from '../src/rekor.ts';
 import { leafHash, merkleRoot } from '../src/merkle.ts';
@@ -394,4 +395,116 @@ test('a fully forged pack (attacker recorder key AND attacker log key) never exi
   const report = await verifyLedger(ledgerDir);
   assert.notEqual(report.exitCode, 0, 'a forged pack must never report success');
   assert.equal(report.exitCode, 4);
+});
+
+test('salt-boundary slide: payload erased into the salt is caught', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const lines = readLines(ledgerDir);
+  const idx = lines.findIndex((l) => l.includes('100.00'));
+  const e = JSON.parse(lines[idx]!) as LedgerEntry;
+
+  // payload_hash is SHA256(salt‖payload) with no length prefix, and salt is
+  // unsigned so redaction can drop it. Absorbing the payload into the salt
+  // keeps the commitment valid while erasing the recorded content.
+  const slid = Buffer.concat([Buffer.from(e.salt!, 'hex'), Buffer.from(e.payload!, 'utf8')]).toString('hex');
+  const original = e.payload;
+  e.salt = slid;
+  e.payload = '';
+  assert.equal(payloadHash(e.salt, e.payload), e.payload_hash, 'the commitment still matches — that is the trap');
+  lines[idx] = JSON.stringify(e);
+  writeLines(ledgerDir, lines);
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, `payload "${original}" was erased and verification passed`);
+  assert.ok(report.findings.some((f) => /malformed salt/.test(f.reason)), JSON.stringify(report.findings));
+});
+
+test('partial slide (front-truncating a payload) is caught too', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  const lines = readLines(ledgerDir);
+  const idx = lines.findIndex((l) => l.includes('100.00'));
+  const e = JSON.parse(lines[idx]!) as LedgerEntry;
+  const bytes = Buffer.from(e.payload!, 'utf8');
+  e.salt = Buffer.concat([Buffer.from(e.salt!, 'hex'), bytes.subarray(0, 10)]).toString('hex');
+  e.payload = bytes.subarray(10).toString('utf8');
+  lines[idx] = JSON.stringify(e);
+  writeLines(ledgerDir, lines);
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1);
+});
+
+test('deleting every anchor is not cheaper than forging one', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  // attacker removes the anchor entry AND the stored Rekor record, hoping the
+  // ledger reads as "never anchored" rather than "anchors removed"
+  const lines = readLines(ledgerDir).filter(
+    (l) => !(JSON.parse(l) as LedgerEntry).payload?.includes('"provider":"rekor-v1"'),
+  );
+  writeLines(ledgerDir, lines);
+  for (const f of readdirSync(join(ledgerDir, 'anchors'))) {
+    if (/^\d+\.json$/.test(f)) unlinkSync(join(ledgerDir, 'anchors', f));
+  }
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 1, 'a pinned log key with zero anchors must not read as never-anchored');
+  assert.ok(report.findings.some((f) => /no anchor entries/.test(f.reason)), JSON.stringify(report.findings));
+});
+
+test('a pack whose manifest claims anchors the ledger lacks is caught', async () => {
+  const { dir, ledgerDir } = buildAnchoredLedger();
+  const packDir = join(dir, 'pack-claims');
+  await buildPack(ledgerDir, packDir);
+  // strip the anchor entry, the stored record, and the pinned key — the
+  // manifest still advertises the anchor
+  const lp = join(packDir, 'ledger', 'entries.jsonl');
+  writeFileSync(
+    lp,
+    readFileSync(lp, 'utf8')
+      .trimEnd()
+      .split('\n')
+      .filter((l) => !(JSON.parse(l) as LedgerEntry).payload?.includes('"provider":"rekor-v1"'))
+      .join('\n') + '\n',
+  );
+  for (const f of readdirSync(join(packDir, 'anchors', 'rekor'))) {
+    unlinkSync(join(packDir, 'anchors', 'rekor', f));
+  }
+  unlinkSync(join(packDir, 'keys', 'rekor-pub.pem'));
+
+  const report = await verifyLedger(packDir);
+  assert.equal(report.exitCode, 1, 'the manifest is evidence too');
+  assert.ok(report.findings.some((f) => /manifest declares an anchor/.test(f.reason)));
+});
+
+test('an intact pack verifies via its ledger file path, not just its directory', async () => {
+  const { dir, ledgerDir } = buildAnchoredLedger();
+  const packDir = join(dir, 'pack-bypath');
+  await buildPack(ledgerDir, packDir);
+  const byDir = await verifyLedger(packDir);
+  const byFile = await verifyLedger(join(packDir, 'ledger', 'entries.jsonl'));
+  assert.equal(byDir.exitCode, 0, JSON.stringify(byDir.findings));
+  assert.equal(byFile.exitCode, byDir.exitCode, JSON.stringify(byFile.findings));
+});
+
+test('a staged anchor from a crashed run is not mistaken for a deleted entry', async () => {
+  const { ledgerDir } = buildAnchoredLedger();
+  // what a crash mid-anchor leaves behind: the record staged, no entry yet
+  writeFileSync(join(ledgerDir, 'anchors', '99.json.partial'), '{"uuid":"x"}');
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 0, JSON.stringify(report.findings));
+});
+
+test('--expect-key binds a ledger to a recorder identity the auditor knows', async () => {
+  const { ledgerDir, keys } = buildAnchoredLedger();
+  const right = await verifyLedger(ledgerDir, { expectKeyId: keys.keyId });
+  assert.equal(right.exitCode, 0, JSON.stringify(right.findings));
+
+  // A fresh-key rewrite is internally consistent — only a known identity catches it.
+  const wrong = await verifyLedger(ledgerDir, { expectKeyId: 'ff'.repeat(8) });
+  assert.equal(wrong.exitCode, 1);
+  assert.ok(wrong.findings.some((f) => /different key than expected/.test(f.reason)));
+
+  // a PEM works as well as a key id
+  const byPem = await verifyLedger(ledgerDir, { expectKeyId: keys.publicPem });
+  assert.equal(byPem.exitCode, 0, JSON.stringify(byPem.findings));
 });

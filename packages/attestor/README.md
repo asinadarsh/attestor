@@ -148,6 +148,8 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
 | Truncate tail (delete newest) | chain stays valid locally; signed checkpoint anchored in Rekor at size *N* proves the log was longer. **Window: entries since last anchor are silently truncatable** | ✅ post-anchor / ⚠️ ≤60 s window |
 | Fork/rollback (show auditor an alternate history) | two Rekor entries under the same `ledger_id`+pubkey with inconsistent roots = cryptographic fork proof; `verify --online` compares anchored checkpoints against the public log | ✅ if verifier queries Rekor |
 | Steal signing key (disk access) | cannot rewrite anchored history without Rekor collusion; **can** forge/fork from theft onward. Rotation bounds blast radius | ⚠️ partial — forward forgery out of scope |
+| Rewrite history under a **fresh key** and anchor it | nothing, unless you tell verify which recorder key to expect (`--expect-key`). Rekor is an open log: anyone may anchor anything, so a self-consistent forgery with its own key and its own genuine anchors passes every internal check | ⚠️ needs `--expect-key` |
+| Delete every anchor so the ledger reads as "never anchored" | the artifacts anchoring leaves behind — a pinned log key, or a pack manifest declaring anchors — are checked against the chain; `--online` also sweeps the log by recorder key | ✅ offline for packs and pinned ledgers |
 | Root on host *during* recording | nothing — recorder signs what it saw; lies fed to it are faithfully attested | ❌ out of scope, say so |
 | Delete entire ledger | Rekor entries under the pubkey survive as existence evidence; absence of a ledger proves nothing about activity | ⚠️ detection only |
 | Compromise of Rekor itself | out of scope; Rekor's own witness/monitor ecosystem | ❌ out of scope |
@@ -191,6 +193,16 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
   measures it — treat the overhead as unquantified until it is. (The fsync
   itself is the real thing on every platform: Node uses `F_FULLFSYNC` on
   macOS and `FlushFileBuffers` on Windows, not a cache-only flush.)
+- **Verification proves consistency, not identity, unless you supply one.**
+  A ledger signed end to end by a key you have never seen is still internally
+  valid. `--expect-key <keyid|pem>` is what turns "this is a coherent ledger"
+  into "this is *their* ledger" — get the recorder's public key the way you
+  would get any other counterparty key, out of band.
+- **The pinned Rekor key is trust-on-first-use.** It is fetched from
+  `ATTESTOR_REKOR_URL` at the first successful anchor and cached at
+  `~/.attestor/keys/rekor-pub.pem`; it is not checked against a Sigstore trust
+  root. If that first fetch was pointed somewhere hostile, the pin is hostile.
+  `attestor verify --rekor-pubkey <file>` lets an auditor supply their own.
 - **Key rotation** is manual (`attestor keys rotate`, old key signs the new
   one into the chain). No revocation list.
 - **Rekor v1** REST API, URL configurable via `ATTESTOR_REKOR_URL`; v1 gets

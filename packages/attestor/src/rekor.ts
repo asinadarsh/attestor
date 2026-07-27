@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -281,8 +282,14 @@ async function tryAnchor(
   mkdirSync(dir, { recursive: true });
   const artifact = canonicalCoreBytes(coreOf(checkpointEntry as unknown as Record<string, unknown>));
   const { uuid, entry } = await postEntry(baseUrl, hashedRekordBody(artifact, ledger.keys));
-  writeFileSync(join(dir, `${checkpointEntry.seq}.json`), JSON.stringify({ uuid, ...entry }, null, 2));
-  await pinRekorKey(baseUrl, ledger.dir, home).catch(() => {});
+  // Stage the Rekor record under a name the verifier ignores, append the
+  // in-chain anchor entry, then publish it with a rename. A crash anywhere in
+  // between leaves either nothing or a complete pair — never a stored anchor
+  // with no entry, which is indistinguishable from an attacker deleting the
+  // entry to hide a rewrite.
+  const finalPath = join(dir, `${checkpointEntry.seq}.json`);
+  const stagedPath = `${finalPath}.partial`;
+  writeFileSync(stagedPath, JSON.stringify({ uuid, ...entry }, null, 2));
   const payload: AnchorPayload = {
     checkpoint_seq: checkpointEntry.seq,
     provider: 'rekor-v1',
@@ -291,12 +298,17 @@ async function tryAnchor(
     integratedTime: entry.integratedTime,
     url: baseUrl,
   };
-  return ledger.append({
+  const anchorEntry = ledger.append({
     type: 'anchor',
     origin: 'system',
     payload: JSON.stringify(payload),
     session_id: checkpointEntry.session_id,
   });
+  renameSync(stagedPath, finalPath);
+  // pinning the log key is a convenience, not part of the anchor record, so it
+  // happens after the window is closed
+  await pinRekorKey(baseUrl, ledger.dir, home).catch(() => {});
+  return anchorEntry;
 }
 
 /**
