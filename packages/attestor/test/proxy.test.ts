@@ -237,7 +237,7 @@ test('classifyLine: request/response/notification/unparsed', () => {
 });
 
 test('install gives each server its own ledger so concurrent servers do not deadlock', async () => {
-  const { wrapConfig } = await import('../src/cli.ts');
+  const { wrapConfig } = await import('../src/mcpconfig.ts');
   const inv = { command: 'attestor', prefixArgs: [] as string[] };
   const config = {
     mcpServers: {
@@ -328,7 +328,7 @@ test('gap survives a process that never recovers: pending note folded in on next
 });
 
 test('install writes a command that actually resolves when attestor is not on PATH', async () => {
-  const { wrapConfig, attestorInvocation } = await import('../src/cli.ts');
+  const { wrapConfig, attestorInvocation } = await import('../src/mcpconfig.ts');
   const config = { mcpServers: { toy: { command: 'node', args: ['server.js'] } } };
   wrapConfig(config, attestorInvocation());
   const def = config.mcpServers.toy;
@@ -347,7 +347,7 @@ test('install writes a command that actually resolves when attestor is not on PA
 });
 
 test('Claude Desktop config path is correct for each platform', async () => {
-  const { claudeDesktopConfigPaths } = await import('../src/cli.ts');
+  const { claudeDesktopConfigPaths } = await import('../src/mcpconfig.ts');
   const paths = claudeDesktopConfigPaths();
   assert.ok(paths.length > 0);
   for (const p of paths) assert.ok(isAbsolute(p), `${p} must be absolute`);

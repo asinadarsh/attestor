@@ -13,8 +13,24 @@ so tampering with any recorded call breaks verification loudly, and even
 rewriting the whole ledger with stolen keys can't beat the public log.
 
 ```sh
-git clone https://github.com/asinadarsh/attestor && cd attestor && npm install
-node packages/attestor/src/cli.ts demo tamper
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/asinadarsh/attestor/main/install.sh | sh
+
+# Windows PowerShell
+irm https://raw.githubusercontent.com/asinadarsh/attestor/main/install.ps1 | iex
+```
+
+The installer builds attestor, puts it on your PATH, and runs `attestor setup`,
+which finds your MCP configs and offers to start recording them. It only asks
+when there is a real decision to make; everything else it does on its own. Piped
+into a shell it has no terminal to ask with, so it prints its plan and stops
+rather than rewriting your config behind your back — finish with `attestor
+setup` in a terminal, or `ATTESTOR_YES=1` to accept the defaults unattended.
+
+Then see what it is for:
+
+```sh
+attestor demo tamper
 # 30 seconds: record → verify green → attacker edits → caught → attacker re-signs everything → still caught
 ```
 
@@ -192,6 +208,7 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
 ## CLI
 
 ```
+attestor setup [--yes]              guided install: key + record your MCP servers
 attestor keys init|list|rotate      P-256 recorder keys (PKCS#8, 0600)
 attestor wrap [opts] -- <cmd...>    record an MCP stdio server
 attestor install [--dry-run]        wrap servers in .mcp.json / Claude Desktop config
