@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest something attestor should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation, not the solution — it often changes what the right fix is.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Worth checking
+      options:
+        - label: This would not add a runtime dependency (the project deliberately has exactly one)
+        - label: This would not weaken what `verify` proves, or if it would, I have said so above

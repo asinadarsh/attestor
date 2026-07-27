@@ -284,6 +284,16 @@ it writes an absolute interpreter and script path into your MCP config, which
 is what the MCP docs recommend anyway, because GUI-launched clients start
 with a minimal PATH.
 
+## Contributing
+
+Issues tagged [`good first issue`](https://github.com/asinadarsh/attestor/labels/good%20first%20issue)
+are scoped to be self-contained; [`help wanted`](https://github.com/asinadarsh/attestor/labels/help%20wanted)
+marks the larger pieces. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the
+three constraints that explain most review comments, and why three tests skip
+by design. Security problems go through
+[private reporting](https://github.com/asinadarsh/attestor/security/advisories/new),
+not public issues — see [SECURITY.md](SECURITY.md).
+
 ## Development
 
 npm-workspaces monorepo: `packages/attestor` (published) +

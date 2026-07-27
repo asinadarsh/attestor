@@ -1,0 +1,48 @@
+name: Bug report
+description: Something behaves differently from what the docs say
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a **security** problem — a tampered ledger that verifies clean, or
+        an honest one that fails — please use
+        [private reporting](https://github.com/asinadarsh/attestor/security/advisories/new)
+        instead. See [SECURITY.md](https://github.com/asinadarsh/attestor/blob/main/SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the exact command and its output. For `verify`, the exit code matters — `echo $?`.
+      placeholder: |
+        $ attestor verify ./my-ledger
+        ...
+        $ echo $?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: attestor version / commit
+      placeholder: "0.1.0, or the commit you built from"
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options: [Linux, macOS, Windows]
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: "`node -v` — must be 24 or newer"
+      placeholder: v24.18.0
+    validations:
+      required: true
