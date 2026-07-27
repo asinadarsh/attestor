@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # lets you re-run the whole matrix on demand, including macOS and Windows,
+  # from the Actions tab or `gh workflow run ci.yml`
+  workflow_dispatch:
 
 jobs:
   test:

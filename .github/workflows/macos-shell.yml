@@ -1,0 +1,40 @@
+# Manual-only: opens an SSH shell on a real macOS runner so you can poke at
+# attestor on macOS without owning a Mac. Never runs automatically.
+#
+#   gh workflow run macos-shell.yml
+#   gh run watch          # then copy the ssh command from the log
+#
+# The session is restricted to the GitHub user who started the run
+# (limit-access-to-actor), which matters because this repository is public and
+# its workflow logs are world-readable. Run `touch /continue` to end it early;
+# it also ends by itself after the timeout below.
+name: macOS shell
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Runner to open a shell on
+        type: choice
+        options: [macos-latest, macos-14, ubuntu-latest]
+        default: macos-latest
+
+jobs:
+  shell:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      # everything is set up before the shell opens, so you land in a working tree
+      - run: npm test
+        continue-on-error: true
+      - name: SSH session
+        # pinned to a commit: this repo argues for supply-chain evidence, so it
+        # should not float a third-party action on a mutable tag
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
+        with:
+          limit-access-to-actor: true
