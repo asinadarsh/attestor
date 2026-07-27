@@ -36,7 +36,8 @@ Options:
   --online              verify against the public Rekor log too
 Env: ATTESTOR_HOME, ATTESTOR_REKOR_URL, ATTESTOR_OFFLINE=1, ATTESTOR_LIVE=1
 
-Exit codes (verify): 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable`;
+Exit codes (verify): 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable
+                     4 chain intact, but anchors not authenticated (use --online)`;
 
 function fail(msg: string): never {
   process.stderr.write(`attestor: ${msg}\n`);

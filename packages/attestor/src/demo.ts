@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import canonicalize from 'canonicalize';
 import { sign as cryptoSign } from 'node:crypto';
-import { generateKey, keyIdOf } from './keys.ts';
+import { attestorHome, generateKey, keyIdOf, keysDir } from './keys.ts';
 import {
   canonicalCoreBytes,
   coreOf,
@@ -213,6 +213,13 @@ function simulateAnchor(ledger: Ledger, ckpt: LedgerEntry): void {
     ),
   );
   writeFileSync(join(anchorsDir, 'rekor-pub.pem'), fakePem);
+  // Pin the simulated log key into the demo's throwaway home, so the offline
+  // run shows the same green→red→caught arc a real anchor would. The anchor
+  // itself is still labelled SIMULATED above — this stands in for "a log you
+  // trust", it does not pretend anything reached the public log.
+  const pinDir = keysDir(attestorHome());
+  mkdirSync(pinDir, { recursive: true });
+  writeFileSync(join(pinDir, 'rekor-pub.pem'), fakePem);
   ledger.append({
     type: 'anchor',
     origin: 'system',

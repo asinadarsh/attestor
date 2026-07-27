@@ -105,8 +105,16 @@ attestor verify <dir> --online   # + compare every anchor against the public Rek
 ```
 
 Exit codes: `0` verified · `1` tamper · `2` usage/IO error · `3` Rekor
-unreachable (CI can tell network from tamper). On tamper you get the entry,
-the reason, the blast radius, and an `audit-packet.json`.
+unreachable (CI can tell network from tamper) · `4` the chain is intact but the
+anchors could not be authenticated. On tamper you get the entry, the reason,
+the blast radius, and an `audit-packet.json`.
+
+**Exit 4 matters more than it looks.** A Rekor key that travels inside the
+artifact cannot vouch for that artifact — an attacker who forges anchors ships
+a matching key. So verifying a pack offline, on a machine that has never
+pinned the log key, does not exit 0; it exits 4 and says the anchors are
+unconfirmed. Only a key you trust independently (`--online`, which fetches it
+live, or a pinned `~/.attestor/keys/rekor-pub.pem`) turns that into a 0.
 
 **What the trust model actually is.** A Rekor log key shipped *inside* an
 evidence pack cannot authenticate that pack — an attacker who forges anchors
@@ -241,8 +249,9 @@ clean, one with a single byte changed. Both reference the same anchor in
 Sigstore's public log, so you can check them against a log I do not control:
 
 ```sh
-node packages/attestor/src/cli.ts verify examples/pack-2026-07           # exit 0
-node packages/attestor/src/cli.ts verify examples/pack-2026-07-TAMPERED  # exit 1
+attestor verify examples/pack-2026-07            # exit 4: chain intact, anchor unconfirmed
+attestor verify examples/pack-2026-07 --online   # exit 0: anchor authenticated against the public log
+attestor verify examples/pack-2026-07-TAMPERED   # exit 1: caught
 ```
 
 See [`examples/README.md`](examples/README.md) for the curl recipe.

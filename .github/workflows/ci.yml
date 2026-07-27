@@ -42,8 +42,37 @@ jobs:
         with:
           node-version: '24'
       - run: npm ci
-      - name: clean pack verifies
-        run: node packages/attestor/src/cli.ts verify examples/pack-2026-07
+      - name: clean pack offline is honest about unconfirmed anchors
+        shell: bash
+        run: |
+          set +e
+          node packages/attestor/src/cli.ts verify examples/pack-2026-07 > /dev/null 2>&1
+          code=$?
+          set -e
+          # 4 = chain intact, anchors not authenticated. A key shipped inside the
+          # pack cannot vouch for the pack, so exit 0 here would be a false pass.
+          if [ "$code" -ne 4 ]; then
+            echo "::error::expected exit 4 verifying offline without a pinned log key, got $code"
+            exit 1
+          fi
+          echo "clean pack correctly reports unconfirmed anchors offline"
+      - name: clean pack authenticates against the real public log
+        shell: bash
+        run: |
+          set +e
+          node packages/attestor/src/cli.ts verify examples/pack-2026-07 --online > /dev/null 2>&1
+          code=$?
+          set -e
+          # 3 = Rekor unreachable; that is a network problem, not a defect here
+          if [ "$code" -eq 3 ]; then
+            echo "::warning::Rekor unreachable — skipping the online assertion"
+            exit 0
+          fi
+          if [ "$code" -ne 0 ]; then
+            echo "::error::expected exit 0 with --online, got $code"
+            exit 1
+          fi
+          echo "anchor authenticated against the public Rekor log"
       - name: tampered pack is rejected
         shell: bash
         run: |

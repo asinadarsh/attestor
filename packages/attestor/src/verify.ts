@@ -1,6 +1,7 @@
 // Verify CLI core: CHAIN → MERKLE → SIG → ANCHOR (offline) → ANCHOR-ONLINE.
 // Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 --online requested
-// but Rekor unreachable. Never trusts stored `hash` fields — every check runs
+// but Rekor unreachable · 4 chain intact but anchors unauthenticated (only a
+// key shipped with the artifact was available, which proves nothing). Never trusts stored `hash` fields — every check runs
 // over recomputed hashes from the signed cores.
 import { createPublicKey, type KeyObject } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
@@ -49,8 +50,8 @@ export interface CheckLine {
 }
 
 export interface VerifyReport {
-  result: 'VERIFIED' | 'TAMPER DETECTED' | 'ERROR' | 'REKOR UNREACHABLE';
-  exitCode: 0 | 1 | 2 | 3;
+  result: 'VERIFIED' | 'ANCHORS UNAUTHENTICATED' | 'TAMPER DETECTED' | 'ERROR' | 'REKOR UNREACHABLE';
+  exitCode: 0 | 1 | 2 | 3 | 4;
   checks: CheckLine[];
   findings: TamperFinding[];
   blastRadius?: { from: number; to: number };
@@ -627,6 +628,9 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
 
   // ---- ANCHOR-ONLINE ----------------------------------------------------
   let rekorUnreachable = false;
+  // set when --online authenticated every anchor against the LIVE log key,
+  // which supersedes the offline "unauthenticated" state
+  let onlineAuthenticatedAll = false;
   if (opts.online) {
     let onlineFailures = 0;
     let checked = 0;
@@ -703,6 +707,8 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
       if (err instanceof RekorUnavailableError) rekorUnreachable = true;
       else throw err;
     }
+    onlineAuthenticatedAll =
+      !rekorUnreachable && onlineFailures === 0 && checked === anchors.length && liveLogKey !== undefined;
     checks.push({
       name: 'ANCHOR-ONLINE',
       ok: !rekorUnreachable && onlineFailures === 0,
@@ -764,9 +770,23 @@ export async function verifyLedger(target: string, opts: VerifyOptions = {}): Pr
   // ---- verdict ----------------------------------------------------------
   const tamper = findings.length > 0;
   const firstSeq = tamper ? Math.min(...findings.map((f) => f.seq)) : undefined;
+  // Anchors that only verify against a key shipped with the artifact prove
+  // nothing — an attacker who forges anchors ships a matching key. That must
+  // not exit 0: the exit code is the machine-readable verdict, and a CI job or
+  // `&&` chain would read 0 as "checked and genuine". Exit 4 says "the chain is
+  // intact, but the external claim is unconfirmed", which is the honest verdict
+  // and fails safe for anything that only tests for success.
+  const unauthenticatedAnchors =
+    !tamper && !rekorUnreachable && unauthenticated > 0 && !onlineAuthenticatedAll;
   const report: VerifyReport = {
-    result: tamper ? 'TAMPER DETECTED' : rekorUnreachable ? 'REKOR UNREACHABLE' : 'VERIFIED',
-    exitCode: tamper ? 1 : rekorUnreachable ? 3 : 0,
+    result: tamper
+      ? 'TAMPER DETECTED'
+      : rekorUnreachable
+        ? 'REKOR UNREACHABLE'
+        : unauthenticatedAnchors
+          ? 'ANCHORS UNAUTHENTICATED'
+          : 'VERIFIED',
+    exitCode: tamper ? 1 : rekorUnreachable ? 3 : unauthenticatedAnchors ? 4 : 0,
     checks,
     findings,
     entryCount: n,
@@ -859,8 +879,16 @@ export function renderReport(report: VerifyReport, useColor = process.stdout.isT
     `RESULT: ${
       report.exitCode === 0
         ? c(GREEN + BOLD, report.result)
-        : c(RED + BOLD, report.result)
+        : report.exitCode === 4
+          ? c(YELLOW + BOLD, report.result)
+          : c(RED + BOLD, report.result)
     }  (exit ${report.exitCode})`,
   );
+  if (report.exitCode === 4) {
+    out.push(
+      c(DIM, '        The hash chain and signatures are intact. What is NOT confirmed is that'),
+    );
+    out.push(c(DIM, '        the anchors are really in the public log — re-run with --online.'));
+  }
   return out.join('\n');
 }

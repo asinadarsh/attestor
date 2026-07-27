@@ -7,7 +7,13 @@ npx attestor verify .            # offline: chain, Merkle roots, signatures, sto
 npx attestor verify . --online   # also compares every anchor against the public Rekor log
 ```
 
-Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable.
+Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable ·
+4 the chain is intact but the anchors could not be authenticated.
+
+Exit 4 is the expected result when you verify this pack offline on a machine
+that has never talked to the log: the Rekor key inside the pack cannot vouch
+for the pack. Run `npx attestor verify . --online`, or follow Option B below,
+to authenticate the anchors against the public log itself.
 
 ## Option B — no attestor, no trust in our code (curl + jq + openssl)
 
@@ -18,15 +24,15 @@ Rekor without running anything we shipped.
 ### 1. The anchor exists in the public log
 
 ```sh
-curl -s "https://rekor.sigstore.dev/api/v1/log/entries/108e9186e8c5677af836f886410e1a2e74e05afd82b8b93f5dcf7e88246e429a5ca690d5d65b9273" | jq .
+curl -s "https://rekor.sigstore.dev/api/v1/log/entries/108e9186e8c5677aa3ee87c0ef6bf1bc317e4a557f97f298ede6c85454e1e60819c77389dab1b3ad" | jq .
 # → the same entry stored in anchors/rekor/11.json
-# → human view: https://search.sigstore.dev/?logIndex=2256661985
+# → human view: https://search.sigstore.dev/?logIndex=2256753011
 ```
 
 ### 2. The stored copy matches the public log byte-for-byte
 
 ```sh
-curl -s "https://rekor.sigstore.dev/api/v1/log/entries/108e9186e8c5677af836f886410e1a2e74e05afd82b8b93f5dcf7e88246e429a5ca690d5d65b9273" \
+curl -s "https://rekor.sigstore.dev/api/v1/log/entries/108e9186e8c5677aa3ee87c0ef6bf1bc317e4a557f97f298ede6c85454e1e60819c77389dab1b3ad" \
   | jq -r '.[].body' > /tmp/public-body.b64
 jq -r '.body' "anchors/rekor/11.json" | diff - /tmp/public-body.b64 && echo MATCH
 ```

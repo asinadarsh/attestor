@@ -12,7 +12,7 @@ import { coreOf, canonicalCoreBytes, hashCore, signCore, genesisPrev, payloadHas
 import { keyIdOf } from '../src/keys.ts';
 import { hashedRekordBody } from '../src/rekor.ts';
 import { leafHash, merkleRoot } from '../src/merkle.ts';
-import { buildAnchoredLedger, fakeRekor } from './helpers.ts';
+import { buildAnchoredLedger, fakeRekor, rekorEntryFor } from './helpers.ts';
 
 function readLines(ledgerDir: string): string[] {
   return readFileSync(join(ledgerDir, 'ledger.jsonl'), 'utf8').trimEnd().split('\n');
@@ -327,4 +327,71 @@ test('delete the anchor entry from an otherwise pristine ledger: still caught', 
   const report = await verifyLedger(ledgerDir);
   assert.equal(report.exitCode, 1);
   assert.ok(report.findings.some((f) => f.check === 'ANCHOR' && /no .*anchor. entry|deleted/.test(f.reason)));
+});
+
+test('anchors verifiable only by the artifact-shipped key do NOT exit 0', async () => {
+  const { ledgerDir, dir } = buildAnchoredLedger();
+  // An auditor on a fresh machine: no pinned Rekor key of their own. The pack
+  // ships one, but a key travelling with the artifact cannot authenticate it.
+  process.env.ATTESTOR_HOME = join(dir, 'no-pin');
+
+  const report = await verifyLedger(ledgerDir);
+  assert.equal(report.exitCode, 4, 'must not report success for an unauthenticated anchor');
+  assert.equal(report.result, 'ANCHORS UNAUTHENTICATED');
+  assert.ok(report.checks.find((c) => c.name === 'ANCHOR')?.warn);
+  assert.ok(report.findings.length === 0, 'this is not tamper — the chain itself is fine');
+});
+
+test('a fully forged pack (attacker recorder key AND attacker log key) never exits 0', async () => {
+  const { ledgerDir, dir, ledgerId } = buildAnchoredLedger();
+  const lines = readLines(ledgerDir);
+  const entries = lines.map((l) => JSON.parse(l) as LedgerEntry);
+
+  // The attacker controls everything shipped in the artifact: they rewrite and
+  // re-sign the ledger with their own recorder key, forge the anchor over the
+  // rewritten checkpoint, and ship their own "Rekor" key to validate it.
+  const atk = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const atkPem = atk.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const fakeLog = fakeRekor();
+
+  let prev = genesisPrev(ledgerId);
+  const newHashes: string[] = [];
+  const rewritten: string[] = [];
+  let ckpt: LedgerEntry | undefined;
+  for (const e of entries) {
+    if (e.type === 'genesis') {
+      e.payload = JSON.stringify({ ledger_id: ledgerId, public_key_pem: atkPem, attestor_version: 1 });
+    }
+    if (e.payload?.includes('100.00')) e.payload = e.payload.replace('100.00', '100000.00');
+    if (e.type === 'checkpoint') {
+      const p = JSON.parse(e.payload!) as { ledger_id: string; tree_size: number; root: string };
+      p.root = merkleRoot(newHashes.slice(0, p.tree_size).map((h) => Buffer.from(h, 'hex'))).toString('hex');
+      e.payload = JSON.stringify(p);
+    }
+    e.key_id = keyIdOf(atk.publicKey);
+    e.prev = prev;
+    e.salt = createHash('sha256').update(e.hash).digest('hex').slice(0, 32);
+    e.payload_hash = payloadHash(e.salt, e.payload);
+    const core = coreOf(e as unknown as Record<string, unknown>);
+    e.hash = hashCore(core);
+    e.sig = signCore(core, atk.privateKey);
+    prev = e.hash;
+    newHashes.push(e.hash);
+    rewritten.push(JSON.stringify(e));
+    if (e.type === 'checkpoint') ckpt = JSON.parse(JSON.stringify(e)) as LedgerEntry;
+  }
+  writeLines(ledgerDir, rewritten);
+
+  // forge the stored anchor over the rewritten checkpoint, signed by the fake log
+  const artifact = canonicalCoreBytes(coreOf(ckpt as unknown as Record<string, unknown>));
+  const forged = rekorEntryFor(fakeLog, hashedRekordBody(artifact, { ...({} as never), privateKey: atk.privateKey, publicPem: atkPem }));
+  writeFileSync(join(ledgerDir, 'anchors', `${ckpt!.seq}.json`), JSON.stringify(forged, null, 2));
+  writeFileSync(join(ledgerDir, 'anchors', 'rekor-pub.pem'), fakeLog.publicPem);
+
+  // auditor has no pin of their own — everything they could check with came
+  // from the attacker
+  process.env.ATTESTOR_HOME = join(dir, 'no-pin');
+  const report = await verifyLedger(ledgerDir);
+  assert.notEqual(report.exitCode, 0, 'a forged pack must never report success');
+  assert.equal(report.exitCode, 4);
 });

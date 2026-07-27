@@ -146,7 +146,13 @@ npx attestor verify .            # offline: chain, Merkle roots, signatures, sto
 npx attestor verify . --online   # also compares every anchor against the public Rekor log
 \`\`\`
 
-Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable.
+Exit codes: 0 verified · 1 tamper · 2 usage/IO error · 3 Rekor unreachable ·
+4 the chain is intact but the anchors could not be authenticated.
+
+Exit 4 is the expected result when you verify this pack offline on a machine
+that has never talked to the log: the Rekor key inside the pack cannot vouch
+for the pack. Run \`npx attestor verify . --online\`, or follow Option B below,
+to authenticate the anchors against the public log itself.
 
 ## Option B — no attestor, no trust in our code (curl + jq + openssl)
 

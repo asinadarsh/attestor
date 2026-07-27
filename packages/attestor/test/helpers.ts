@@ -5,7 +5,7 @@ import { createHash, generateKeyPairSync, sign as cryptoSign, type KeyObject } f
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateKey, type KeyPair } from '../src/keys.ts';
+import { attestorHome, generateKey, keysDir, type KeyPair } from '../src/keys.ts';
 import { canonicalCoreBytes, coreOf, Ledger, type LedgerEntry } from '../src/ledger.ts';
 import { hashedRekordBody, type AnchorPayload } from '../src/rekor.ts';
 import { leafHash } from '../src/merkle.ts';
@@ -89,6 +89,13 @@ export function fakeAnchor(
   mkdirSync(anchorsDir, { recursive: true });
   writeFileSync(join(anchorsDir, `${ckpt.seq}.json`), JSON.stringify(stored, null, 2));
   writeFileSync(join(anchorsDir, 'rekor-pub.pem'), rekor.publicPem);
+  // Also pin it as the HOST key, standing in for an auditor who trusts this log
+  // independently. Without a pin the anchor is unauthenticated (exit 4) — and
+  // ATTESTOR_HOME must be set per test, or this would read the developer's real
+  // ~/.attestor and make results depend on machine state.
+  const pinDir = keysDir(attestorHome());
+  mkdirSync(pinDir, { recursive: true });
+  writeFileSync(join(pinDir, 'rekor-pub.pem'), rekor.publicPem);
   const payload: AnchorPayload = {
     checkpoint_seq: ckpt.seq,
     provider: 'rekor-v1',
@@ -115,6 +122,8 @@ export function buildAnchoredLedger(opts: { calls?: number } = {}): {
 } {
   const dir = tmp();
   const ledgerDir = join(dir, 'ledger');
+  // hermetic: never touch the developer's real ~/.attestor
+  process.env.ATTESTOR_HOME = join(dir, 'home');
   const keys = generateKey(join(dir, 'home'));
   const ledger = Ledger.open(ledgerDir, keys);
   const rekor = fakeRekor();
