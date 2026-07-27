@@ -11,7 +11,7 @@
 // are still forwarded (the action already happened — hiding the response
 // records nothing and misleads the agent). `continue` relays everything and
 // appends a signed gap marker on recovery.
-import { spawn } from 'node:child_process';
+import { spawnServer } from './spawn.ts';
 import { hostname, userInfo } from 'node:os';
 import { basename } from 'node:path';
 import type { Checkpointer } from './checkpoint.ts';
@@ -164,10 +164,9 @@ export function runProxy(opts: ProxyOptions): Promise<number> {
     }),
   });
 
-  const child = spawn(opts.command, opts.args, {
-    stdio: ['pipe', 'pipe', 'inherit'],
-    shell: false,
-  });
+  // Windows needs cmd.exe for the `.cmd` shims MCP servers ship as; spawnServer
+  // handles that with hand-escaped arguments (never shell:true).
+  const child = spawnServer(opts.command, opts.args);
 
   return new Promise<number>((resolve) => {
     let settled = false;

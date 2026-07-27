@@ -137,7 +137,15 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
 - **stdio only** for MVP. Streamable-HTTP MCP proxying is deferred by design
   (SSE resume/ordering is genuinely subtle; punting beats shipping it
   half-right). Claude Desktop / Claude Code local servers are stdio.
-- **Windows unsupported** for MVP (POSIX fsync/lockfile assumptions).
+- **Windows is supported but the least exercised.** CI runs the full suite,
+  the evidence-pack check and the demo on Windows, macOS and Linux, so the
+  claim is tested rather than asserted — but it has far less real-world use
+  than Linux. Two Windows specifics worth knowing: `.cmd` shims (which is what
+  `npx` is) are launched through `cmd.exe` with hand-escaped arguments rather
+  than `shell: true`, and arguments containing a newline or NUL are refused
+  because they cannot be escaped safely. File permissions are not applied by
+  Windows the way `chmod` is, so the signing key's ACL is set with `icacls`;
+  if that fails you get a loud warning instead of a silently readable key.
 - **Anchoring is a public write.** Each anchor puts a digest, your recorder
   public key, and a timestamp permanently into a shared transparency log.
   Nothing sensitive leaves your machine, but *that you were active, and when,
@@ -146,7 +154,9 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
 - **No published latency numbers yet.** `--on-error block` with
   `--durability strict` puts an fsync in the path of every tool call. Tool
   calls take 10 ms–10 s so it should be noise, but nothing in this repo
-  measures it — treat the overhead as unquantified until it is.
+  measures it — treat the overhead as unquantified until it is. (The fsync
+  itself is the real thing on every platform: Node uses `F_FULLFSYNC` on
+  macOS and `FlushFileBuffers` on Windows, not a cache-only flush.)
 - **Key rotation** is manual (`attestor keys rotate`, old key signs the new
   one into the chain). No revocation list.
 - **Rekor v1** REST API, URL configurable via `ATTESTOR_REKOR_URL`; v1 gets
@@ -209,6 +219,22 @@ node packages/attestor/src/cli.ts verify examples/pack-2026-07-TAMPERED  # exit 
 ```
 
 See [`examples/README.md`](examples/README.md) for the curl recipe.
+
+## Platform support
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Test suite + build | CI | CI | CI |
+| Evidence-pack verify (clean + tampered) | CI | CI | CI |
+| `demo tamper` end to end | CI | CI | CI |
+| Real-world use | yes | light | light |
+
+Node 24+ is required on all three (the CLI runs TypeScript directly via
+Node's native type stripping). `npm install` builds the `attestor` binary;
+`npm link` puts it on your PATH. `attestor install` does not depend on that —
+it writes an absolute interpreter and script path into your MCP config, which
+is what the MCP docs recommend anyway, because GUI-launched clients start
+with a minimal PATH.
 
 ## Development
 

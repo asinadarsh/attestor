@@ -7,7 +7,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # OS support is a claim this project makes, so it is tested rather than
+    # asserted in the README.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,3 +24,30 @@ jobs:
       # build step is the only thing that catches type errors before a user does.
       - run: npm test
       - run: npm run build
+
+  evidence:
+    # The headline claim — a tampered ledger must fail verification — checked
+    # against the committed evidence packs on every platform.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - name: clean pack verifies
+        run: node packages/attestor/src/cli.ts verify examples/pack-2026-07
+      - name: tampered pack is rejected
+        shell: bash
+        run: |
+          if node packages/attestor/src/cli.ts verify examples/pack-2026-07-TAMPERED; then
+            echo "::error::tampered evidence pack verified clean — the core claim is broken"
+            exit 1
+          fi
+          echo "tampered pack correctly rejected"
+      - name: demo runs end to end
+        run: node packages/attestor/src/cli.ts demo tamper
