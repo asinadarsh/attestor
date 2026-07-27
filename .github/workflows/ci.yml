@@ -54,3 +54,79 @@ jobs:
           echo "tampered pack correctly rejected"
       - name: demo runs end to end
         run: node packages/attestor/src/cli.ts demo tamper
+
+  installer:
+    # The installers are the documented front door: if they break, nobody can
+    # install at all. Run them against this checkout (ATTESTOR_REPO points at
+    # the local clone) so a PR is tested, not whatever main happens to be.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install unattended (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/proj"
+          cd "$RUNNER_TEMP/proj"
+          cat > .mcp.json <<'EOF'
+          { "mcpServers": { "toy": { "command": "node", "args": ["server.js"], "env": {"SECRET":"keep-me"} } } }
+          EOF
+          # exactly the form the README documents
+          cat "$GITHUB_WORKSPACE/install.sh" | ATTESTOR_REPO="$GITHUB_WORKSPACE" HOME="$RUNNER_TEMP" sh -s -- --yes
+          export PATH="$RUNNER_TEMP/.local/bin:$PATH"
+          attestor --help > /dev/null
+          node -e '
+            const c = require("'"$RUNNER_TEMP"'/proj/.mcp.json").mcpServers.toy;
+            const fs = require("fs");
+            if (!c.args.includes("wrap")) { console.error("config was not wrapped:", c); process.exit(1); }
+            if (c.command !== "attestor" && !fs.existsSync(c.command)) { console.error("unlaunchable command:", c.command); process.exit(1); }
+            if (c.env?.SECRET !== "keep-me") { console.error("env not preserved:", c.env); process.exit(1); }
+            if (!fs.existsSync("'"$RUNNER_TEMP"'/proj/.mcp.json.bak")) { console.error("no backup left"); process.exit(1); }
+            console.log("installer produced a launchable, wrapped config");
+          '
+
+      - name: install unattended (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $proj = Join-Path $env:RUNNER_TEMP 'proj'
+          New-Item -ItemType Directory -Force -Path $proj | Out-Null
+          '{ "mcpServers": { "toy": { "command": "node", "args": ["server.js"], "env": {"SECRET":"keep-me"} } } }' |
+            Set-Content (Join-Path $proj '.mcp.json')
+          Push-Location $proj
+          $env:ATTESTOR_REPO = $env:GITHUB_WORKSPACE
+          $env:USERPROFILE = $env:RUNNER_TEMP
+          & "$env:GITHUB_WORKSPACE\install.ps1" -Yes
+          Pop-Location
+          $cfg = Get-Content (Join-Path $proj '.mcp.json') -Raw | ConvertFrom-Json
+          $toy = $cfg.mcpServers.toy
+          if ($toy.args -notcontains 'wrap') { throw "config was not wrapped: $($toy | ConvertTo-Json -Compress)" }
+          if ($toy.command -ne 'attestor' -and -not (Test-Path $toy.command)) { throw "unlaunchable command: $($toy.command)" }
+          if ($toy.env.SECRET -ne 'keep-me') { throw 'env not preserved' }
+          if (-not (Test-Path (Join-Path $proj '.mcp.json.bak'))) { throw 'no backup left' }
+          Write-Host 'installer produced a launchable, wrapped config'
+
+      - name: piped install must not rewrite a config without consent
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/proj2"
+          cd "$RUNNER_TEMP/proj2"
+          echo '{ "mcpServers": { "toy": { "command": "node", "args": ["server.js"] } } }' > .mcp.json
+          cp .mcp.json expected.json
+          cat "$GITHUB_WORKSPACE/install.sh" | ATTESTOR_REPO="$GITHUB_WORKSPACE" HOME="$RUNNER_TEMP" sh
+          if ! diff -q .mcp.json expected.json; then
+            echo "::error::a piped install rewrote the MCP config without consent"
+            exit 1
+          fi
+          echo "piped install correctly left the config alone"

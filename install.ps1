@@ -7,9 +7,14 @@
 # is installed globally through npm.
 #
 # When run from a pipe (irm | iex has no interactive stdin) the setup step only
-# prints its plan and will not touch your MCP config. Run `attestor setup` in a
-# terminal to finish, or set $env:ATTESTOR_YES=1 to accept defaults unattended.
+# prints its plan and will not touch your MCP config. To finish unattended, set
+# the variable in the same session first — it is the same shell, so this works
+# where the POSIX `VAR=1 curl | sh` form would not:
+#
+#   $env:ATTESTOR_YES=1; irm .../install.ps1 | iex
+param([switch]$Yes)
 $ErrorActionPreference = 'Stop'
+if ($Yes) { $env:ATTESTOR_YES = '1' }
 
 function Say($msg) { Write-Host $msg }
 function Die($msg) { Write-Error "attestor: $msg"; exit 1 }

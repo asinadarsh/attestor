@@ -8,9 +8,24 @@
 # globally through npm.
 #
 # When run from a pipe (no terminal) the setup step only prints its plan and
-# will not touch your MCP config — re-run `attestor setup` from a terminal, or
-# pass ATTESTOR_YES=1 to accept the defaults unattended.
+# will not touch your MCP config. To finish unattended, pass --yes THROUGH the
+# shell — `ATTESTOR_YES=1 curl ... | sh` would set the variable for curl, not
+# for this script:
+#
+#   curl -fsSL .../install.sh | sh -s -- --yes
 set -eu
+
+ATTESTOR_YES="${ATTESTOR_YES:-}"
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes) ATTESTOR_YES=1 ;;
+    -h|--help)
+      echo "usage: install.sh [--yes]"
+      echo "  --yes   accept defaults and finish setup without prompting"
+      exit 0 ;;
+    *) printf 'attestor: unknown option: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 REPO="${ATTESTOR_REPO:-https://github.com/asinadarsh/attestor.git}"
 SRC="${ATTESTOR_SRC:-$HOME/.attestor/src}"
@@ -69,7 +84,7 @@ esac
 
 # ---- hand off to the wizard ------------------------------------------------
 say ""
-if [ "${ATTESTOR_YES:-}" = "1" ]; then
+if [ "$ATTESTOR_YES" = "1" ]; then
   exec "$BIN_DIR/attestor" setup --yes
 elif [ -t 0 ]; then
   exec "$BIN_DIR/attestor" setup
@@ -78,5 +93,6 @@ else
   # without someone actually agreeing to it
   "$BIN_DIR/attestor" setup || true
   say ""
-  say "  Run 'attestor setup' from a terminal to finish, or re-run with ATTESTOR_YES=1."
+  say "  Run 'attestor setup' from a terminal to finish, or install unattended with:"
+  say "    curl -fsSL <url>/install.sh | sh -s -- --yes"
 fi

@@ -24,8 +24,18 @@ The installer builds attestor, puts it on your PATH, and runs `attestor setup`,
 which finds your MCP configs and offers to start recording them. It only asks
 when there is a real decision to make; everything else it does on its own. Piped
 into a shell it has no terminal to ask with, so it prints its plan and stops
-rather than rewriting your config behind your back — finish with `attestor
-setup` in a terminal, or `ATTESTOR_YES=1` to accept the defaults unattended.
+rather than rewriting your config behind your back. Finish with `attestor
+setup` in a terminal, or accept the defaults unattended:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/asinadarsh/attestor/main/install.sh | sh -s -- --yes
+```
+```powershell
+$env:ATTESTOR_YES=1; irm https://raw.githubusercontent.com/asinadarsh/attestor/main/install.ps1 | iex
+```
+
+(`ATTESTOR_YES=1 curl … | sh` would set the variable for `curl`, not for the
+script — hence `sh -s --`.)
 
 Then see what it is for:
 
