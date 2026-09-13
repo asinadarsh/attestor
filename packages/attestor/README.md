@@ -206,11 +206,35 @@ Control mappings (SOC 2 CC7.2/CC7.3/CC4.1, EU AI Act Art. 12, HIPAA
   valid. `--expect-key <keyid|pem>` is what turns "this is a coherent ledger"
   into "this is *their* ledger" — get the recorder's public key the way you
   would get any other counterparty key, out of band.
-- **The pinned Rekor key is trust-on-first-use.** It is fetched from
-  `ATTESTOR_REKOR_URL` at the first successful anchor and cached at
-  `~/.attestor/keys/rekor-pub.pem`; it is not checked against a Sigstore trust
-  root. If that first fetch was pointed somewhere hostile, the pin is hostile.
-  `attestor verify --rekor-pubkey <file>` lets an auditor supply their own.
+- **The pinned Rekor key is trust-on-first-use, gated for the official log.**
+  It is fetched from `ATTESTOR_REKOR_URL` at the first successful anchor and
+  cached at `~/.attestor/keys/rekor-pub.pem`. When the URL targets the
+  official public log (canonicalized hostname `rekor.sigstore.dev` — spelling
+  tricks, uppercase, and a trailing DNS root dot do not change the host), the
+  fetched key must match a built-in Sigstore trust-root allowlist or pinning
+  fails loudly (`UntrustedRekorKeyError`); key material that does not parse
+  fails the same way rather than escaping as a generic crypto error. The same
+  allowlist is enforced wherever a key is used — `verify --online` live
+  fetches, and existing local/home pins (including legacy pins taken before
+  this gate existed) whenever they authenticate an anchor that claims the
+  official log. Pins are a keyring, stored per log ID at
+  `~/.attestor/keys/rekor-pub-<logID>.pem`, so a Sigstore key rotation ships as
+  an added allowlist ID and both keys stay usable during migration: each anchor
+  is verified under the key matching its own `logID`, which is what lets one
+  ledger span a rotation. The single-file `rekor-pub.pem` is kept pointing at
+  the first key seen, so pins taken before the keyring existed still work — and
+  it is only used for an anchor whose `logID` equals that key's own SPKI digest,
+  since a pre-keyring pin carries no log ID and standing it in for a different
+  log would verify honest anchors under the wrong key. **`verify --online` does
+  not yet do per-anchor selection**: it fetches the log's one current key and
+  applies it to every anchor, so anchors written before a log-key rotation are
+  not authenticated by `--online` even when their keys are pinned and the
+  offline path authenticates them. Use the pinned path, or supply the specific
+  key with `--rekor-pubkey`, for a ledger that spans a rotation.
+  Custom logs are NOT gated: any other host is the auditor's own
+  trust decision, pinned TOFU as before — if that first fetch was pointed
+  somewhere hostile, the pin is hostile. `attestor verify --rekor-pubkey
+  <file>` lets an auditor supply their own key either way.
 - **Key rotation** is manual (`attestor keys rotate`, old key signs the new
   one into the chain). No revocation list.
 - **Rekor v1** REST API, URL configurable via `ATTESTOR_REKOR_URL`; v1 gets

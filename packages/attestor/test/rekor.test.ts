@@ -14,13 +14,16 @@ import { writeCheckpoint } from '../src/checkpoint.ts';
 import {
   anchorCheckpoint,
   backoffMs,
+  DEFAULT_REKOR_URL,
   getEntry,
   hashedRekordBody,
   postEntry,
   readPending,
   retryPending,
+  UntrustedRekorKeyError,
   verifyCheckpointNote,
   verifyRekorInclusion,
+  verifyRekorKeyTrust,
   verifySET,
   type RekorEntry,
 } from '../src/rekor.ts';
@@ -86,7 +89,7 @@ interface MockRekor {
   server: Server;
   url: string;
   posts: Record<string, unknown>[];
-  mode: 'ok' | 'dup' | 'down' | 'ratelimit' | 'divergent';
+  mode: 'ok' | 'dup' | 'down' | 'ratelimit' | 'divergent' | 'roguekey';
   close: () => Promise<void>;
 }
 
@@ -134,7 +137,10 @@ function startMockRekor(): Promise<MockRekor> {
         return;
       }
       if (req.method === 'GET' && req.url === '/api/v1/log/publicKey') {
-        res.writeHead(200, { 'Content-Type': 'application/x-pem-file' }).end(rekor.publicPem);
+        // roguekey: the live key endpoint serves a key that never signed
+        // anything in this log (substitution attack at the point of use)
+        const served = state.mode === 'roguekey' ? fakeRekor().publicPem : rekor.publicPem;
+        res.writeHead(200, { 'Content-Type': 'application/x-pem-file' }).end(served);
         return;
       }
       res.writeHead(404).end();
@@ -317,6 +323,29 @@ test('verify --online: full pass against the mock log, then catches divergence',
   }
 });
 
+test('online-substitution attack: live key endpoint serves a rogue key: exit 1, not authenticated', async () => {
+  const mock = await startMockRekor();
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  try {
+    const ledger = Ledger.open(join(dir, 'ledger'), keys);
+    ledger.append({ type: 'wire', origin: 'proxy', payload: '"x"' });
+    const ckpt = writeCheckpoint(ledger);
+    await anchorCheckpoint(ledger, ckpt, { baseUrl: mock.url });
+    ledger.close();
+
+    // now the log's key endpoint answers with a key that signed nothing here
+    mock.mode = 'roguekey';
+    const report = await verifyLedger(join(dir, 'ledger'), { online: true, rekorUrl: mock.url });
+    assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+    assert.ok(report.findings.some((f) => f.check === 'ANCHOR-ONLINE'));
+  } finally {
+    delete process.env.ATTESTOR_HOME;
+    await mock.close();
+  }
+});
+
 test('verify --online exit 3 when Rekor unreachable', async () => {
   const dir = tmp();
   const keys = generateKey(join(dir, 'home'));
@@ -350,4 +379,64 @@ test('live Rekor smoke: post + fetch + SET verify', { skip: process.env.ATTESTOR
   assert.equal(fetched.body, entry.body);
   assert.ok(verifySET(fetched, fixture.rekor_log_public_key_pem));
   assert.ok(verifyRekorInclusion(fetched));
+});
+
+test('verifyRekorKeyTrust passes for official Sigstore Rekor log key', () => {
+  assert.doesNotThrow(() => {
+    verifyRekorKeyTrust('https://rekor.sigstore.dev', fixture.rekor_log_public_key_pem);
+  });
+});
+
+test('verifyRekorKeyTrust throws UntrustedRekorKeyError for unknown key targeting official Sigstore', () => {
+  const fakeKeyPem = generateKey(tmp()).publicPem;
+  assert.throws(
+    () => {
+      verifyRekorKeyTrust('https://rekor.sigstore.dev', fakeKeyPem);
+    },
+    UntrustedRekorKeyError,
+  );
+});
+
+test('online gate: a key served for the OFFICIAL host that is not Sigstore\'s fails the trust root', async () => {
+  // The sibling substitution test points `rekorUrl` at localhost, which is a
+  // custom log — so it exits 1 on a bad signature and would still pass if the
+  // exact-official-host online gate were deleted. This seam keeps the auditor's
+  // trusted URL as the real official host (so the gate applies) and redirects
+  // only the transport to the mock. The mock signs everything correctly and is
+  // in 'ok' mode, so a plain signature check would PASS here: the only thing
+  // that can fail is the trust-root allowlist itself.
+  const mock = await startMockRekor();
+  const dir = tmp();
+  const keys = generateKey(join(dir, 'home'));
+  process.env.ATTESTOR_HOME = join(dir, 'home');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: Parameters<typeof realFetch>[0], init?: Parameters<typeof realFetch>[1]) => {
+    const href = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url;
+    return realFetch(
+      href.startsWith(DEFAULT_REKOR_URL) ? mock.url + href.slice(DEFAULT_REKOR_URL.length) : href,
+      init,
+    );
+  }) as typeof globalThis.fetch;
+  try {
+    const ledger = Ledger.open(join(dir, 'ledger'), keys);
+    ledger.append({ type: 'wire', origin: 'proxy', payload: '"x"' });
+    const ckpt = writeCheckpoint(ledger);
+    // anchored against the mock as a custom log, so the OFFLINE gate stays out
+    // of this and the finding under test can only come from the online one
+    await anchorCheckpoint(ledger, ckpt, { baseUrl: mock.url });
+    ledger.close();
+
+    const report = await verifyLedger(join(dir, 'ledger'), { online: true, rekorUrl: DEFAULT_REKOR_URL });
+    assert.equal(report.exitCode, 1, JSON.stringify(report.findings, null, 2));
+    assert.ok(
+      report.findings.some(
+        (f) => f.check === 'ANCHOR-ONLINE' && /does not match any pinned Sigstore trust root/.test(f.reason),
+      ),
+      `expected a trust-root finding, got ${JSON.stringify(report.findings, null, 2)}`,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.ATTESTOR_HOME;
+    await mock.close();
+  }
 });

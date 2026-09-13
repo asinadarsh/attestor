@@ -6,13 +6,14 @@ import { createHash, createPublicKey, sign as cryptoSign, verify as cryptoVerify
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import type { KeyPair } from './keys.ts';
-import { attestorHome, keysDir } from './keys.ts';
+import { attestorHome, isRekorPinFile, keysDir } from './keys.ts';
 import {
   canonicalCoreBytes,
   coreOf,
@@ -24,6 +25,102 @@ import {
 import { leafHash, rootFromInclusion } from './merkle.ts';
 
 export const DEFAULT_REKOR_URL = 'https://rekor.sigstore.dev';
+
+export class UntrustedRekorKeyError extends Error {}
+
+/**
+ * Pinned SHA-256 SPKI log IDs for official Sigstore Rekor instances
+ * (matches logID: sha256(spki_der)).
+ *
+ * Rotation / migration: this is a set, not a single value. When Sigstore
+ * rotates the log key (or shards the log), the new ID is ADDED here and both
+ * remain valid until ledgers anchored under the old key have aged out — so a
+ * pin taken before the rotation still authenticates, and a fresh pin taken
+ * after it does too. Removing an ID is the (rare) revocation act and is a
+ * breaking change by design.
+ *
+ * Custom logs: the allowlist gates ONLY the official public host. Any other
+ * host (a private Rekor, a mock in tests, and also lookalike spellings of the
+ * official domain) is a custom log: the auditor chose it and pinned its key
+ * themselves, and this list makes no claim about it. What the gate prevents
+ * is exactly one thing — a key that is NOT Sigstore's being accepted as if it
+ * were the official log's.
+ */
+export const KNOWN_SIGSTORE_REKOR_LOG_IDS: readonly string[] = [
+  'c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d', // Sigstore active v1 log
+];
+
+/** Compute RFC 6962 / Sigstore log ID: sha256(SPKI DER). */
+export function getSpkiFingerprint(pem: string): string {
+  const key = createPublicKey(pem);
+  const der = key.export({ type: 'spki', format: 'der' });
+  return createHash('sha256').update(der).digest('hex');
+}
+
+/**
+ * WHATWG-canonicalized hostname, with the DNS root label normalized away.
+ *
+ * `new URL()` lowercases and IDNA/punycodes the host but PRESERVES a terminal
+ * root dot, and it percent-decodes `%2e` into that same dot. So
+ * `rekor.sigstore.dev.`, `rekor.sigstore.dev%2e/` and `rekor.sigstore.dev.:443/`
+ * all yield `rekor.sigstore.dev.` — DNS-equivalent to the bare name, but not
+ * string-equal to it, which let them slip past exact host classification and be
+ * treated as custom logs.
+ *
+ * Exactly one terminal dot is stripped. `rekor.sigstore.dev..` has an empty
+ * label, is not a resolvable name, and deliberately stays distinct.
+ */
+function canonicalHost(baseUrl: string): string | undefined {
+  let hostname: string;
+  try {
+    hostname = new URL(baseUrl).hostname;
+  } catch {
+    return undefined; // unparsable → cannot be the official host (fetch would fail anyway)
+  }
+  return hostname.endsWith('.') && !hostname.endsWith('..')
+    ? hostname.slice(0, -1)
+    : hostname;
+}
+
+/**
+ * True when `baseUrl` targets the official public Sigstore Rekor instance.
+ * The comparison is on the canonicalized hostname (lowercased, IDNA/punycoded,
+ * root dot normalized) — never on the raw string. Raw matching was bypassable
+ * in both directions: `HTTPS://REKOR.SIGSTORE.DEV` read as a custom log (gate
+ * skipped for the real host), while substring matching promoted lookalike
+ * hosts that merely contained the official name.
+ */
+export function isOfficialSigstoreHost(baseUrl: string): boolean {
+  const host = canonicalHost(baseUrl);
+  return host !== undefined && host === canonicalHost(DEFAULT_REKOR_URL);
+}
+
+/**
+ * Verify a log public key against the pinned Sigstore trust root when (and
+ * only when) `baseUrl` targets the official public Rekor host. Throws
+ * `UntrustedRekorKeyError` — callers must let it surface, not swallow it.
+ *
+ * Unparsable key material for the official host is a trust failure, not an
+ * incidental crypto error: `createPublicKey()` throws something generic, which
+ * would otherwise escape this contract and surface as a crash rather than as a
+ * trust finding.
+ */
+export function verifyRekorKeyTrust(baseUrl: string, pem: string): void {
+  if (!isOfficialSigstoreHost(baseUrl)) return; // custom log: the auditor's own trust decision
+  let fingerprint: string;
+  try {
+    fingerprint = getSpkiFingerprint(pem);
+  } catch (err) {
+    throw new UntrustedRekorKeyError(
+      `Unusable Rekor public key for ${baseUrl}: key material did not parse as an SPKI public key (${(err as Error).message}).`,
+    );
+  }
+  if (!KNOWN_SIGSTORE_REKOR_LOG_IDS.includes(fingerprint)) {
+    throw new UntrustedRekorKeyError(
+      `Untrusted Rekor public key for ${baseUrl}: SPKI digest ${fingerprint} does not match any pinned Sigstore trust root key.`,
+    );
+  }
+}
 
 /** Bound every Rekor request so exit-time anchor flushes can never hang. */
 const FETCH_TIMEOUT_MS = 10_000;
@@ -306,8 +403,13 @@ async function tryAnchor(
   });
   renameSync(stagedPath, finalPath);
   // pinning the log key is a convenience, not part of the anchor record, so it
-  // happens after the window is closed
-  await pinRekorKey(baseUrl, ledger.dir, home).catch(() => {});
+  // happens after the window is closed. Network failure while pinning is a
+  // missed convenience and stays silent — but an UNTRUSTED key is a trust
+  // failure and must surface loudly, not be swallowed with it. The anchor
+  // entry itself is already recorded and stays valid; what failed is pinning.
+  await pinRekorKey(baseUrl, ledger.dir, home, entry.logID).catch((err) => {
+    if (err instanceof UntrustedRekorKeyError) throw err;
+  });
   return anchorEntry;
 }
 
@@ -337,17 +439,121 @@ export async function anchorCheckpoint(
   }
 }
 
-/** Pin the Rekor log public key on first successful anchor. */
-export async function pinRekorKey(baseUrl: string, ledgerDir: string, home?: string): Promise<void> {
-  const local = join(anchorsDir(ledgerDir), 'rekor-pub.pem');
-  if (existsSync(local)) return;
-  const pem = await getLogPublicKey(baseUrl);
-  mkdirSync(anchorsDir(ledgerDir), { recursive: true });
-  writeFileSync(local, pem);
+/**
+ * True for a well-formed Rekor log ID: sha256(SPKI DER), lowercase hex.
+ *
+ * Log IDs arrive inside log responses, so they are attacker-controlled on any
+ * path that reaches a hostile or impersonated log. Nothing derived from one may
+ * touch the filesystem before this returns true.
+ */
+export function isLogId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/**
+ * Filename a log key is pinned under, keyed by its log ID (SPKI digest).
+ *
+ * Refuses anything that is not a log ID rather than interpolating it: the
+ * result is used as a path segment, and a value carrying `..`, a separator or
+ * a different length is a traversal or a collision with another log's pin.
+ */
+export function rekorKeyPinName(logId: string): string {
+  if (!isLogId(logId)) {
+    throw new UntrustedRekorKeyError(
+      `Refusing to build a pin filename from a malformed Rekor log ID: ${JSON.stringify(logId).slice(0, 80)}`,
+    );
+  }
+  return `rekor-pub-${logId}.pem`;
+}
+
+/**
+ * Read every pinned Rekor log key found in `dirs`, keyed by log ID.
+ *
+ * A pin set has to be a keyring rather than a single file for the documented
+ * rotation policy to mean anything: a ledger can span a key rotation, so its
+ * anchors legitimately carry different `logID`s and no single key verifies all
+ * of them. Keys are indexed by their real SPKI digest, recomputed here — the
+ * filename is a hint, never the trust decision. The legacy single-file pin
+ * (`rekor-pub.pem`) is read in as just another keyring member so pins taken
+ * before this existed keep working.
+ *
+ * Earlier directories win, so callers can pass host pins ahead of artifact
+ * pins and keep the "the artifact cannot vouch for itself" ordering.
+ */
+export function readRekorKeyring(dirs: readonly string[]): Map<string, string> {
+  const ring = new Map<string, string>();
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!isRekorPinFile(name)) continue;
+      let pem: string;
+      try {
+        pem = readFileSync(join(dir, name), 'utf8');
+      } catch {
+        continue;
+      }
+      let fingerprint: string;
+      try {
+        fingerprint = getSpkiFingerprint(pem);
+      } catch {
+        continue; // unparsable pin is not a usable key; the trust gate reports it
+      }
+      if (!ring.has(fingerprint)) ring.set(fingerprint, pem);
+    }
+  }
+  return ring;
+}
+
+/**
+ * Pin the Rekor log public key.
+ *
+ * `logId` is the log ID of the entry that was just anchored. When a pin for
+ * that exact log already exists there is nothing to learn and no request is
+ * made; when the log has rotated its key, the ID is new, so the new key is
+ * fetched, trust-checked, and pinned ALONGSIDE the old one instead of being
+ * skipped because some pin file happened to exist. That skip was why the
+ * documented rotation policy could not work.
+ */
+export async function pinRekorKey(
+  baseUrl: string,
+  ledgerDir: string,
+  home?: string,
+  logId?: string,
+): Promise<void> {
+  const dir = anchorsDir(ledgerDir);
   const homeKeys = keysDir(home ?? attestorHome());
+  // The log ID comes from the log's own response. A malformed one must not
+  // reach a path, and must not be able to satisfy the preflight: skipping here
+  // skips the fetch AND the trust gate below, so an attacker who can make two
+  // chosen paths exist would suppress the check entirely. An unrecognised ID
+  // falls through to the fetch and is gated like any other.
+  if (isLogId(logId)) {
+    const name = rekorKeyPinName(logId);
+    if (existsSync(join(dir, name)) && existsSync(join(homeKeys, name))) return;
+  } else if (logId === undefined && existsSync(join(dir, 'rekor-pub.pem'))) {
+    return; // no log ID to distinguish by — preserve the original pin-once behaviour
+  }
+  const pem = await getLogPublicKey(baseUrl);
+  verifyRekorKeyTrust(baseUrl, pem);
+  // Index the pin by the key's own digest, not by the log ID the entry claimed,
+  // so a lying logID cannot cause a key to be filed under someone else's name.
+  const name = rekorKeyPinName(getSpkiFingerprint(pem));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), pem);
   mkdirSync(homeKeys, { recursive: true });
-  const homePin = join(homeKeys, 'rekor-pub.pem');
-  if (!existsSync(homePin)) writeFileSync(homePin, pem);
+  writeFileSync(join(homeKeys, name), pem);
+  // Keep the legacy single-file pin pointing at the first key ever seen, so
+  // older verifiers reading only this path behave exactly as before.
+  const legacyLocal = join(dir, 'rekor-pub.pem');
+  if (!existsSync(legacyLocal)) writeFileSync(legacyLocal, pem);
+  const legacyHome = join(homeKeys, 'rekor-pub.pem');
+  if (!existsSync(legacyHome)) writeFileSync(legacyHome, pem);
 }
 
 function pendingPath(ledgerDir: string): string {
